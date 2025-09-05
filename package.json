@@ -1,25 +1,36 @@
 {
   "name": "music-sync-backend",
   "version": "1.0.0",
-  "description": "",
+  "description": "Celebeaty – Backend mit integriertem Frontend Build",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "build:public": "npm run _build:frontend && rm -rf public && mkdir -p public && cp -a frontend/build/. public/",
-    "_build:frontend": "NPM_CONFIG_PRODUCTION=false npm --prefix frontend ci || (NPM_CONFIG_PRODUCTION=false npm --prefix frontend install && npm --prefix frontend audit fix --force || true);     NPM_CONFIG_PRODUCTION=false npm --prefix frontend run build"
+    "build": "npm run build:frontend && npm run copy:public",
+    "build:frontend": "npm --prefix frontend ci && npm --prefix frontend run build",
+    "copy:public": "rimraf public && shx mkdir -p public && shx cp -r frontend/build/* public/"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "dependencies": {
     "axios": "^1.11.0",
+    "bcrypt": "^6.0.0",
     "cookie-parser": "^1.4.7",
     "cors": "^2.8.5",
     "dotenv": "^16.6.1",
+    "expo-server-sdk": "^4.0.0",
     "express": "^4.21.2",
     "express-session": "^1.18.2",
+    "jsdom": "^26.1.0",
     "node-fetch": "^2.7.0",
+    "pg": "^8.16.3",
     "uuid": "^11.1.0",
     "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "copyfiles": "^2.4.1",
+    "dotenv-cli": "^10.0.0",
+    "rimraf": "^5.0.10",
+    "shx": "^0.3.4"
   }
 }
