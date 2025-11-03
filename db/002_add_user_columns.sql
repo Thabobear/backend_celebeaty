@@ -1,14 +1,25 @@
--- E-Mail des Spotify-Accounts
-ALTER TABLE public.users ADD COLUMN IF NOT EXISTS email text;
+-- Immer ins richtige Schema
+SET search_path TO public;
 
--- Anzeigename, Land, Abo-Typ (free/premium)
-ALTER TABLE public.users ADD COLUMN IF NOT EXISTS display_name text;
-ALTER TABLE public.users ADD COLUMN IF NOT EXISTS country text;
-ALTER TABLE public.users ADD COLUMN IF NOT EXISTS product text;
+-- Guard: nur ausführen, wenn 'users' existiert
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.tables
+    WHERE table_schema='public' AND table_name='users'
+  ) THEN
+    RAISE NOTICE 'Table public.users not found – skipping 002_add_user_columns.sql';
+    RETURN;
+  END IF;
+END $$;
 
--- Timestamps (falls noch nicht vorhanden)
-ALTER TABLE public.users ADD COLUMN IF NOT EXISTS created_at timestamptz DEFAULT now();
-ALTER TABLE public.users ADD COLUMN IF NOT EXISTS updated_at timestamptz DEFAULT now();
+-- optionale Felder & Index; idempotent
+ALTER TABLE users
+  ADD COLUMN IF NOT EXISTS email        TEXT,
+  ADD COLUMN IF NOT EXISTS country      TEXT,
+  ADD COLUMN IF NOT EXISTS product      TEXT,
+  ADD COLUMN IF NOT EXISTS display_name TEXT,
+  ADD COLUMN IF NOT EXISTS created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  ADD COLUMN IF NOT EXISTS updated_at   TIMESTAMPTZ NOT NULL DEFAULT now();
 
--- Optional: kleine Hilfs-Indexe
-CREATE INDEX IF NOT EXISTS idx_users_email ON public.users (email);
+CREATE INDEX IF NOT EXISTS idx_users_email ON users (email);
