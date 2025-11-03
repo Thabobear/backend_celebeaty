@@ -647,25 +647,29 @@ app.post("/share/start", async (req, res) => {
     const rtHeader = (req.headers["x-refresh-token"] || "").toString() || null;
     const atHeader = (req.headers.authorization || "").replace(/^Bearer\s+/i, "") || null;
 
+    // User auf PRIMARY KEY "id" upserten (FK der sessions zeigt auf users.id)
     await pool.query(
       `
-      INSERT INTO users (spotify_id, display_name, refresh_token_enc, access_token, access_expires_at, created_at, updated_at)
-      VALUES ($1, $2, $3, $4, now() + interval '55 minutes', now(), now())
-      ON CONFLICT (spotify_id)
+      INSERT INTO users (id, display_name, refresh_token_enc, access_token, access_expires_at, created_at, updated_at, spotify_id)
+      VALUES ($1, $2, $3, $4, now() + interval '55 minutes', now(), now(), $1)
+      ON CONFLICT (id)
       DO UPDATE SET
-        display_name = EXCLUDED.display_name,
-        access_token = EXCLUDED.access_token,
-        access_expires_at = EXCLUDED.access_expires_at,
-        updated_at = now(),
-        refresh_token_enc = COALESCE(EXCLUDED.refresh_token_enc, users.refresh_token_enc)
+        display_name        = EXCLUDED.display_name,
+        access_token        = EXCLUDED.access_token,
+        access_expires_at   = EXCLUDED.access_expires_at,
+        updated_at          = now(),
+        refresh_token_enc   = COALESCE(EXCLUDED.refresh_token_enc, users.refresh_token_enc),
+        spotify_id          = COALESCE(users.spotify_id, EXCLUDED.spotify_id)
       `,
-      [who.id, who.name, rtHeader, atHeader]
+      [who.id, who.name || who.id, rtHeader, atHeader]
     );
 
+    // Prüfen anhand users.id (nicht spotify_id)
     const chk = await pool.query(
-      `SELECT refresh_token_enc FROM users WHERE spotify_id = $1`,
+      `SELECT refresh_token_enc FROM users WHERE id = $1`,
       [who.id]
     );
+
     if (!chk.rowCount || !chk.rows[0].refresh_token_enc) {
       return res.status(400).json({
         error: "no_refresh_token",
