@@ -447,6 +447,9 @@ async function getCurrentSpotifyId(req, res) {
   return { id: me.data.id, name: me.data.display_name || me.data.id };
 }
 
+
+
+
 app.get("/sessions/active", async (req, res) => {
   try {
     const { rows } = await pool.query(
@@ -640,6 +643,35 @@ app.post("/share/start", async (req, res) => {
   try {
     const who = await getCurrentSpotifyId(req, res);
     if (who.error) return res.status(who.error.status || 401).json(who.error.body || { error: "no_me" });
+
+    const rtHeader = (req.headers["x-refresh-token"] || "").toString() || null;
+    const atHeader = (req.headers.authorization || "").replace(/^Bearer\s+/i, "") || null;
+
+    await pool.query(
+      `
+      INSERT INTO users (spotify_id, display_name, refresh_token_enc, access_token, access_expires_at, created_at, updated_at)
+      VALUES ($1, $2, $3, $4, now() + interval '55 minutes', now(), now())
+      ON CONFLICT (spotify_id)
+      DO UPDATE SET
+        display_name = EXCLUDED.display_name,
+        access_token = EXCLUDED.access_token,
+        access_expires_at = EXCLUDED.access_expires_at,
+        updated_at = now(),
+        refresh_token_enc = COALESCE(EXCLUDED.refresh_token_enc, users.refresh_token_enc)
+      `,
+      [who.id, who.name, rtHeader, atHeader]
+    );
+
+    const chk = await pool.query(
+      `SELECT refresh_token_enc FROM users WHERE spotify_id = $1`,
+      [who.id]
+    );
+    if (!chk.rowCount || !chk.rows[0].refresh_token_enc) {
+      return res.status(400).json({
+        error: "no_refresh_token",
+        message: "Kein Refresh-Token vorhanden. Bitte neu einloggen und das Teilen erneut starten.",
+      });
+    }
 
     const existing = await pool.query(
       `SELECT id FROM sessions WHERE sender_spotify_id = $1 LIMIT 1`,
