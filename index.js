@@ -105,18 +105,23 @@ async function spotifyPut(url, token, body) {
     validateStatus: () => true,
   });
 }
-
 /** Token aus Cookies, ggf. refresh */
 async function withValidAccessToken(req, res) {
+  // Access-Token: erst Header, dann Cookie
   let accessToken =
     (req.headers.authorization || "").replace(/^Bearer\s+/i, "") ||
     req.cookies.sp_at;
+
+  // Refresh-Token: erst Header (mobil), dann Cookie (Web)
   const refreshTokenHeader = req.headers["x-refresh-token"];
   const refreshTokenCookie = req.cookies.sp_rt;
   const refreshToken = refreshTokenHeader || refreshTokenCookie;
+
   if (!accessToken && !refreshToken) {
     return { error: { status: 401, body: { error: "no_token" } } };
   }
+
+  // Falls kein AT da, aber ein RT → refreshe
   if (!accessToken && refreshToken) {
     const rr = await refreshAccessToken(refreshToken);
     if (rr.status !== 200) {
@@ -125,6 +130,8 @@ async function withValidAccessToken(req, res) {
     accessToken = rr.data.access_token;
     const expires_in = rr.data.expires_in || 3600;
     const base = cookieBase(req);
+
+    // Für Web legen wir Cookies, mobil ist es egal (App sendet Header)
     res.cookie("sp_at", accessToken, { ...base, maxAge: (expires_in - 30) * 1000 });
     if (rr.data.refresh_token) {
       res.cookie("sp_rt", rr.data.refresh_token, { ...base, maxAge: 30 * 24 * 3600 * 1000 });
@@ -132,6 +139,7 @@ async function withValidAccessToken(req, res) {
   }
   return { accessToken };
 }
+
 
 /* -------------------- Health -------------------- */
 app.get("/health", async (req, res) => {
@@ -147,6 +155,8 @@ app.get("/health", async (req, res) => {
 });
 
 /* -------------------- Auth ---------------------- */
+// /login und /force-login nehmen optional ?return_to=celebeaty://auth entgegen.
+// Wir legen das in den OAuth "state", damit /callback zur App zurückleiten kann.
 app.get("/login", (req, res) => {
   const rt = typeof req.query.return_to === "string" && isAllowedReturnTo(req.query.return_to)
     ? req.query.return_to
@@ -163,6 +173,7 @@ app.get("/force-login", (req, res) => {
   return res.redirect(url);
 });
 
+/* -------------------- Callback ------------------ */
 app.get("/callback", async (req, res) => {
   const code = req.query.code;
   const stateStr = req.query.state;
@@ -170,6 +181,7 @@ app.get("/callback", async (req, res) => {
   const returnTo = stateObj && typeof stateObj.rt === "string" && isAllowedReturnTo(stateObj.rt) ? stateObj.rt : null;
 
   if (!code) {
+    // Falls Fehler + return_to vorhanden → zurück in die App mit error
     if (returnTo) {
       const u = new URL(returnTo);
       u.searchParams.set("ok", "0");
@@ -191,7 +203,6 @@ app.get("/callback", async (req, res) => {
       }),
       { headers: { "Content-Type": "application/x-www-form-urlencoded" } }
     );
-
     const { access_token, refresh_token, expires_in } = tokenRes.data || {};
     if (!access_token) {
       if (returnTo) {
@@ -203,6 +214,7 @@ app.get("/callback", async (req, res) => {
       return res.status(500).json({ error: "No access_token from Spotify", details: tokenRes.data });
     }
 
+    // Wer bin ich?
     const meRes = await spotifyGet("https://api.spotify.com/v1/me", access_token);
     if (meRes.status !== 200) {
       if (returnTo) {
@@ -217,10 +229,12 @@ app.get("/callback", async (req, res) => {
     const userId = me.id;
     const displayName = me.display_name || userId || null;
 
+    // Cookies
     const base = cookieBase(req);
     res.cookie("sp_at", access_token, { ...base, maxAge: Math.max(1, (expires_in || 3600) - 30) * 1000 });
     if (refresh_token) res.cookie("sp_rt", refresh_token, { ...base, maxAge: 30 * 24 * 3600 * 1000 });
 
+    // User upsert (refresh_token nur überschreiben, wenn neu)
     await pool.query(
       `
       INSERT INTO users (id, display_name, refresh_token_enc, access_token, access_expires_at, email, country, product, created_at, updated_at)
@@ -248,6 +262,7 @@ app.get("/callback", async (req, res) => {
       ]
     );
 
+    // Erfolg: Priorität App-Deep-Link, sonst Frontend/UI
     if (returnTo) {
       const u = new URL(returnTo);
       u.searchParams.set("ok", "1");
@@ -257,6 +272,7 @@ app.get("/callback", async (req, res) => {
     return res.redirect(`${front}/`);
   } catch (err) {
     console.error("Token exchange failed:", err.response?.data || err.message);
+    // Fehlerfall → wenn return_to da ist, dorthin mit Fehlercode
     const returnTo = (() => {
       const s = req.query.state ? b64uDecode(req.query.state) : null;
       const rt = s && typeof s.rt === "string" ? s.rt : null;
@@ -273,13 +289,98 @@ app.get("/callback", async (req, res) => {
 });
 
 /* -------------------- Info APIs ---------------- */
+app.get("/whoami", async (req, res) => {
+  try {
+    const t = await withValidAccessToken(req, res);
+    if (t.error) return res.status(t.error.status).json(t.error.body);
+
+    let r = await spotifyGet("https://api.spotify.com/v1/me", t.accessToken);
+    if (r.status === 401 && req.cookies.sp_rt) {
+      const rr = await refreshAccessToken(req.cookies.sp_rt);
+      if (rr.status === 200) {
+        const at = rr.data.access_token;
+        const expires_in = rr.data.expires_in || 3600;
+        const base = cookieBase(req);
+        res.cookie("sp_at", at, { ...base, maxAge: (expires_in - 30) * 1000 });
+        if (rr.data.refresh_token) res.cookie("sp_rt", rr.data.refresh_token, { ...base, maxAge: 30 * 24 * 3600 * 1000 });
+        r = await spotifyGet("https://api.spotify.com/v1/me", at);
+      }
+    }
+    if (r.status === 429) {
+      const retry = Number(r.headers["retry-after"] || 1);
+      res.set("Retry-After", String(retry));
+      return res.status(429).json({ error: "rate_limited", retry_after: retry });
+    }
+    if (r.status >= 400) return res.status(r.status).json({ error: "spotify_error", details: r.data });
+
+    const j = r.data || {};
+    return res.json({
+      id: j.id,
+      display_name: j.display_name || j.id || null,
+      email: j.email || null,
+      country: j.country || null,
+      product: j.product || null,
+    });
+  } catch (e) {
+    console.error("whoami error:", e.message);
+    return res.status(500).json({ error: "whoami_failed" });
+  }
+});
+
 app.get("/currently-playing", async (req, res) => {
   try {
     const t = await withValidAccessToken(req, res);
     if (t.error) return res.status(t.error.status).json(t.error.body);
+
     let r = await spotifyGet("https://api.spotify.com/v1/me/player/currently-playing", t.accessToken);
+    if (r.status === 401 && req.cookies.sp_rt) {
+      const rr = await refreshAccessToken(req.cookies.sp_rt);
+      if (rr.status === 200) {
+        const at = rr.data.access_token;
+        const expires_in = rr.data.expires_in || 3600;
+        const base = cookieBase(req);
+        res.cookie("sp_at", at, { ...base, maxAge: (expires_in - 30) * 1000 });
+        if (rr.data.refresh_token) res.cookie("sp_rt", rr.data.refresh_token, { ...base, maxAge: 30 * 24 * 3600 * 1000 });
+        r = await spotifyGet("https://api.spotify.com/v1/me/player/currently-playing", at);
+      }
+    }
+
+    if (r.status === 429) {
+      const retry = Number(r.headers["retry-after"] || 1);
+      res.set("Retry-After", String(retry));
+      return res.status(429).json({ error: "rate_limited", retry_after: retry });
+    }
+
     if (r.status === 204 || !r.data) return res.json({ message: "Kein Song wird gerade gespielt.", reason: "no_item" });
-    return res.json(r.data);
+
+    if (r.status === 200 && r.data) {
+      const data = r.data;
+      const item = data.item;
+      if (!item) {
+        return res.json({
+          message: "Kein item. Evtl. Werbung oder private session.",
+          reason: data.currently_playing_type || "no_item",
+        });
+      }
+      return res.json({
+        is_playing: !!data.is_playing,
+        progress_ms: data.progress_ms || 0,
+        track: {
+          id: item.id,
+          name: item.name,
+          artists: (item.artists || []).map((a) => a.name),
+          album: {
+            name: item.album?.name,
+            images: item.album?.images || [],
+            spotify_url: item.album?.external_urls?.spotify || null,
+          },
+          spotify_url: item.external_urls?.spotify || null,
+          duration_ms: item.duration_ms || 0,
+        },
+      });
+    }
+
+    return res.status(r.status).json({ error: "spotify_error", details: r.data });
   } catch (e) {
     console.error("currently-playing error:", e.response?.data || e.message);
     return res.status(500).json({ error: "currently_playing_failed" });
@@ -337,8 +438,7 @@ app.post("/spotify/pause", async (req, res) => {
   }
 });
 
-/* -------------------- Sessions + Polling ----------------------- */
-
+/* -------------------- Sessions API ----------------------- */
 async function getCurrentSpotifyId(req, res) {
   const t = await withValidAccessToken(req, res);
   if (t.error) return { error: t.error };
@@ -347,18 +447,26 @@ async function getCurrentSpotifyId(req, res) {
   return { id: me.data.id, name: me.data.display_name || me.data.id };
 }
 
+
+
+
 app.get("/sessions/active", async (req, res) => {
   try {
-    const { rows } = await pool.query(`
-      SELECT s.id AS session_id, s.sender_spotify_id AS user_id,
-             COALESCE(u.display_name, s.sender_spotify_id) AS display_name,
-             s.created_at, s.last_snapshot_at
+    const { rows } = await pool.query(
+      `
+      SELECT 
+        s.id AS session_id,
+        s.sender_spotify_id AS user_id,
+        COALESCE(u.display_name, s.sender_spotify_id) AS display_name,
+        s.created_at,
+        s.last_snapshot_at
       FROM sessions s
       LEFT JOIN users u ON u.id = s.sender_spotify_id
       WHERE s.is_active = true
       ORDER BY COALESCE(s.last_snapshot_at, s.created_at) DESC
       LIMIT 50
-    `);
+      `
+    );
     res.json({
       active: rows.length,
       sessions: rows.map((r) => ({
@@ -375,7 +483,8 @@ app.get("/sessions/active", async (req, res) => {
   }
 });
 
-const pollers = new Map();
+/* ===== Polling-Manager (Server sendet Events, wenn Sender teilt) ===== */
+const pollers = new Map(); // key: sender_spotify_id -> { timer, lastSnapshot }
 
 async function getFreshTokenForUser(userId) {
   const uRes = await pool.query(
@@ -384,12 +493,14 @@ async function getFreshTokenForUser(userId) {
   );
   if (!uRes.rowCount) throw new Error("user not found");
   const u = uRes.rows[0];
+
   const now = Date.now();
   const exp = u.access_expires_at ? new Date(u.access_expires_at).getTime() : 0;
   if (u.access_token && exp > now + 30 * 1000) {
     return u.access_token;
   }
   if (!u.refresh_token_enc) throw new Error("no refresh token");
+
   const rr = await refreshAccessToken(u.refresh_token_enc);
   if (rr.status !== 200) throw new Error("refresh failed: " + rr.status);
   const newAT = rr.data.access_token;
@@ -415,34 +526,107 @@ function broadcastJSON(obj) {
 
 function startPollingForSender(senderId, senderName) {
   if (pollers.has(senderId)) return;
-  const state = { lastTrackId: null, lastIsPlaying: null, lastProgress: 0, lastKeepalive: 0 };
+
+  const state = {
+    lastTrackId: null,
+    lastIsPlaying: null,
+    lastProgress: 0,
+    lastKeepalive: 0,
+  };
+
   const timer = setInterval(async () => {
     try {
       const at = await getFreshTokenForUser(senderId);
       const r = await spotifyGet("https://api.spotify.com/v1/me/player/currently-playing", at);
-      if (r.status === 204 || !r.data || !r.data.item) return;
-      const item = r.data.item;
+
+      if (r.status === 204 || !r.data || !r.data.item) {
+        if (state.lastTrackId && state.lastIsPlaying === true) {
+          broadcastJSON({
+            type: "track",
+            kind: "playstate",
+            user: { id: senderId, name: senderName || senderId },
+            trackId: state.lastTrackId,
+            progress_ms: state.lastProgress || 0,
+            is_playing: false,
+            ts: Date.now(),
+          });
+          state.lastIsPlaying = false;
+        }
+        return;
+      }
+
+      const data = r.data;
+      const item = data.item;
       const trackId = item.id;
-      const progress = r.data.progress_ms || 0;
-      const is_playing = !!r.data.is_playing;
+      const progress = data.progress_ms || 0;
+      const is_playing = !!data.is_playing;
+
       await pool.query(
         `UPDATE sessions SET last_snapshot_at = now() WHERE sender_spotify_id = $1 AND is_active = true`,
         [senderId]
       );
-      broadcastJSON({
-        type: "track",
-        kind: "keepalive",
-        user: { id: senderId, name: senderName || senderId },
-        trackId,
-        progress_ms: progress,
-        is_playing,
-        ts: Date.now(),
-      });
+
+      const trackChanged = trackId !== state.lastTrackId;
+      const playStateChanged = (is_playing ? 1 : 0) !== (state.lastIsPlaying ? 1 : 0);
+      let seekDetected = false;
+      if (!trackChanged && !playStateChanged) {
+        const delta = Math.abs(progress - (state.lastProgress || 0));
+        seekDetected = delta > 3000 || ((state.lastProgress || 0) - progress) > 1500;
+      }
+
+      const now = Date.now();
+      const needKeepalive = now - (state.lastKeepalive || 0) > 15000;
+
+      if (trackChanged) {
+        broadcastJSON({
+          type: "track",
+          kind: "trackchange",
+          user: { id: senderId, name: senderName || senderId },
+          trackId,
+          progress_ms: progress,
+          name: item.name,
+          artists: (item.artists || []).map((a) => a.name),
+          image: item.album?.images?.[0]?.url || null,
+          is_playing,
+          ts: now,
+        });
+      } else if (playStateChanged) {
+        broadcastJSON({
+          type: "track",
+          kind: "playstate",
+          user: { id: senderId, name: senderName || senderId },
+          trackId,
+          progress_ms: progress,
+          name: item.name,
+          artists: (item.artists || []).map((a) => a.name),
+          image: item.album?.images?.[0]?.url || null,
+          is_playing,
+          ts: now,
+        });
+      } else if (seekDetected || needKeepalive) {
+        broadcastJSON({
+          type: "track",
+          kind: seekDetected ? "seek" : "keepalive",
+          user: { id: senderId, name: senderName || senderId },
+          trackId,
+          progress_ms: progress,
+          name: item.name,
+          artists: (item.artists || []).map((a) => a.name),
+          image: item.album?.images?.[0]?.url || null,
+          is_playing,
+          ts: now,
+        });
+        if (needKeepalive) state.lastKeepalive = now;
+      }
+
       state.lastTrackId = trackId;
       state.lastIsPlaying = is_playing;
       state.lastProgress = progress;
-    } catch {}
+    } catch (e) {
+      // leise weiter
+    }
   }, 2000);
+
   pollers.set(senderId, { timer, state });
 }
 
@@ -463,6 +647,7 @@ app.post("/share/start", async (req, res) => {
     const rtHeader = (req.headers["x-refresh-token"] || "").toString() || null;
     const atHeader = (req.headers.authorization || "").replace(/^Bearer\s+/i, "") || null;
 
+    // User auf PRIMARY KEY "id" upserten (FK der sessions zeigt auf users.id)
     await pool.query(
       `
       INSERT INTO users (id, display_name, refresh_token_enc, access_token, access_expires_at, created_at, updated_at, spotify_id)
@@ -478,6 +663,19 @@ app.post("/share/start", async (req, res) => {
       `,
       [who.id, who.name || who.id, rtHeader, atHeader]
     );
+
+    // Prüfen anhand users.id (nicht spotify_id)
+    const chk = await pool.query(
+      `SELECT refresh_token_enc FROM users WHERE id = $1`,
+      [who.id]
+    );
+
+    if (!chk.rowCount || !chk.rows[0].refresh_token_enc) {
+      return res.status(400).json({
+        error: "no_refresh_token",
+        message: "Kein Refresh-Token vorhanden. Bitte neu einloggen und das Teilen erneut starten.",
+      });
+    }
 
     const existing = await pool.query(
       `SELECT id FROM sessions WHERE sender_spotify_id = $1 LIMIT 1`,
@@ -515,7 +713,6 @@ app.post("/share/stop", async (req, res) => {
 
     await pool.query(`UPDATE sessions SET is_active = false WHERE sender_spotify_id = $1`, [who.id]);
     stopPollingForSender(who.id);
-    broadcastJSON({ type: "session_end", userId: who.id, ts: Date.now() }); // 🧩 NEW: Info an Clients
     res.json({ ok: true });
   } catch (e) {
     console.error("share/stop error:", e.message);
@@ -538,11 +735,6 @@ wss.on("connection", (ws) => {
     let data;
     try { data = JSON.parse(raw); } catch { return; }
 
-    // 🧩 NEW: userId merken, falls "hello" gesendet wurde
-    if (data?.type === "hello" && data.userId) {
-      ws.userId = data.userId;
-    }
-
     wss.clients.forEach((client) => {
       if (client !== ws && client.readyState === WebSocket.OPEN) {
         try { client.send(JSON.stringify(data)); } catch {}
@@ -554,43 +746,7 @@ wss.on("connection", (ws) => {
       try { ws.send(JSON.stringify({ type: "listener_count", count, ts: Date.now() })); } catch {}
     }
   });
-
-  // 🧩 NEW: Session Cleanup, wenn Socket geschlossen wird
-  ws.on("close", async () => {
-    if (ws.userId) {
-      try {
-        await pool.query(`UPDATE sessions SET is_active = false WHERE sender_spotify_id = $1`, [ws.userId]);
-        stopPollingForSender(ws.userId);
-        broadcastJSON({ type: "session_end", userId: ws.userId, ts: Date.now() });
-        console.log("[Cleanup] Session von", ws.userId, "deaktiviert (WS close)");
-      } catch (err) {
-        console.error("[Cleanup] Fehler beim Session-Cleanup:", err.message);
-      }
-    }
-  });
 });
-
-// 🧩 NEW: Automatischer Cleanup alter Sessions
-setInterval(async () => {
-  try {
-    const res = await pool.query(`
-      UPDATE sessions
-      SET is_active = false
-      WHERE is_active = true
-        AND (now() - COALESCE(last_snapshot_at, created_at)) > interval '30 minutes'
-      RETURNING sender_spotify_id
-    `);
-    if (res.rowCount > 0) {
-      console.log("[Cleanup] Alte Sessions geschlossen:", res.rowCount);
-      res.rows.forEach((r) => {
-        stopPollingForSender(r.sender_spotify_id);
-        broadcastJSON({ type: "session_end", userId: r.sender_spotify_id, ts: Date.now() });
-      });
-    }
-  } catch (e) {
-    console.error("[Cleanup] Fehler beim Auto-Cleanup:", e.message);
-  }
-}, 5 * 60 * 1000);
 
 /* -------------------- Start ------------------------------ */
 const PORT = process.env.PORT || 3001;
