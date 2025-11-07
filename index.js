@@ -524,6 +524,15 @@ function broadcastJSON(obj) {
   });
 }
 
+function broadcastSessionEnded(senderId, senderName) {
+  broadcastJSON({
+    type: "session",
+    kind: "ended",
+    user: { id: senderId, name: senderName || senderId },
+    ts: Date.now(),
+  });
+}
+
 function startPollingForSender(senderId, senderName) {
   if (pollers.has(senderId)) return;
 
@@ -713,6 +722,8 @@ app.post("/share/stop", async (req, res) => {
 
     await pool.query(`UPDATE sessions SET is_active = false WHERE sender_spotify_id = $1`, [who.id]);
     stopPollingForSender(who.id);
+    // → Allen Zuhörer:innen signalisieren: Session endet
+    broadcastSessionEnded(who.id, who.name);
     res.json({ ok: true });
   } catch (e) {
     console.error("share/stop error:", e.message);
