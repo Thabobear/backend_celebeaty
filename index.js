@@ -485,6 +485,8 @@ app.get("/sessions/active", async (req, res) => {
 
 /* ===== Polling-Manager (Server sendet Events, wenn Sender teilt) ===== */
 const pollers = new Map(); // key: sender_spotify_id -> { timer, lastSnapshot }
+// Follower-Registry: senderId -> Set<followerId>
+const followersBySender = new Map(); 
 
 async function getFreshTokenForUser(userId) {
   const uRes = await pool.query(
@@ -513,6 +515,77 @@ async function getFreshTokenForUser(userId) {
     await pool.query(`UPDATE users SET refresh_token_enc=$1 WHERE id=$2`, [rr.data.refresh_token, userId]);
   }
   return newAT;
+}
+
+/** Spotify-Helfer für einen beliebigen Nutzer (Follower) */
+async function spGetForUser(userId, url) {
+  const at = await getFreshTokenForUser(userId);
+  return spotifyGet(url, at);
+}
+async function spPutForUser(userId, url, body) {
+  const at = await getFreshTokenForUser(userId);
+  return spotifyPut(url, at, body);
+}
+
+/** Playback für einen Follower an den Sender-Zustand angleichen */
+async function alignFollowerPlayback(followerId, { trackId, progress, shouldPlay, forcePosition }) {
+  try {
+    // 1) Geräte checken
+    const devRes = await spGetForUser(followerId, "https://api.spotify.com/v1/me/player/devices");
+    const devices = (devRes.status === 200 && devRes.data && devRes.data.devices) ? devRes.data.devices : [];
+    if (!devices.length) {
+      // Kein Device sichtbar → serverseitig nicht lösbar (App kann Spotify nicht „öffnen“)
+      return;
+    }
+    // iPhone/Smartphone bevorzugen
+    const device =
+      devices.find(d => /iPhone|iOS|Smartphone/i.test(d?.name) || d?.type === "Smartphone") ||
+      devices.find(d => d?.is_active) ||
+      devices.find(d => !d?.is_restricted) ||
+      devices[0];
+    if (!device) return;
+
+    // 2) ggf. auf dieses Device transferieren (aktivieren)
+    if (!device.is_active) {
+      await spPutForUser(followerId, "https://api.spotify.com/v1/me/player", {
+        device_ids: [device.id],
+        play: !!shouldPlay,
+      });
+      await new Promise(r => setTimeout(r, 600));
+    }
+
+    // 3) Play/Pause senden
+    if (!shouldPlay) {
+      await spPutForUser(followerId, "https://api.spotify.com/v1/me/player/pause", {});
+      return;
+    }
+    // Play – je nach Event Position setzen
+    const body = forcePosition
+      ? { uris: [`spotify:track:${trackId}`], position_ms: Math.max(0, progress || 0) }
+      : {};
+    await spPutForUser(followerId, "https://api.spotify.com/v1/me/player/play", body);
+  } catch (e) {
+    // leise: 403/404 typischerweise wenn kein aktives Device / Spotify nicht bereit
+  }
+}
+
+/** Follower eines Senders synchronisieren (nur auf „relevante“ Events reagieren) */
+async function fanoutToFollowers(senderId, payload) {
+  const set = followersBySender.get(senderId);
+  if (!set || !set.size) return;
+  const { kind, trackId, progress_ms, is_playing } = payload || {};
+  if (!trackId) return;
+  if (!["trackchange", "seek", "playstate"].includes(kind)) return; // keepalive ignorieren
+
+  const jobs = Array.from(set).map(fid =>
+    alignFollowerPlayback(fid, {
+      trackId,
+      progress: progress_ms || 0,
+      shouldPlay: !!is_playing,
+      forcePosition: kind === "trackchange" || kind === "seek",
+    })
+  );
+  await Promise.allSettled(jobs);
 }
 
 function broadcastJSON(obj) {
@@ -587,7 +660,7 @@ function startPollingForSender(senderId, senderName) {
       const needKeepalive = now - (state.lastKeepalive || 0) > 15000;
 
       if (trackChanged) {
-        broadcastJSON({
+        const msg = {
           type: "track",
           kind: "trackchange",
           user: { id: senderId, name: senderName || senderId },
@@ -598,9 +671,12 @@ function startPollingForSender(senderId, senderName) {
           image: item.album?.images?.[0]?.url || null,
           is_playing,
           ts: now,
-        });
+        };
+
+        broadcastJSON(msg);
+        fanoutToFollowers(senderId, msg);
       } else if (playStateChanged) {
-        broadcastJSON({
+        const msg = {
           type: "track",
           kind: "playstate",
           user: { id: senderId, name: senderName || senderId },
@@ -611,9 +687,12 @@ function startPollingForSender(senderId, senderName) {
           image: item.album?.images?.[0]?.url || null,
           is_playing,
           ts: now,
-        });
+        };
+
+        broadcastJSON(msg);
+        fanoutToFollowers(senderId, msg);
       } else if (seekDetected || needKeepalive) {
-        broadcastJSON({
+        const msg = {
           type: "track",
           kind: seekDetected ? "seek" : "keepalive",
           user: { id: senderId, name: senderName || senderId },
@@ -624,7 +703,10 @@ function startPollingForSender(senderId, senderName) {
           image: item.album?.images?.[0]?.url || null,
           is_playing,
           ts: now,
-        });
+        };
+
+        broadcastJSON(msg);
+        // keepalive NICHT fanouten (würde zu viel Traffic erzeugen)
         if (needKeepalive) state.lastKeepalive = now;
       }
 
@@ -646,6 +728,60 @@ function stopPollingForSender(senderId) {
     pollers.delete(senderId);
   }
 }
+
+/* ---- Follow-Registration: Receiver meldet sich/ab ---- */
+app.post("/follow/start", async (req, res) => {
+  try {
+    const who = await getCurrentSpotifyId(req, res); // ← das ist der Follower (aktueller User)
+    if (who.error) return res.status(who.error.status || 401).json(who.error.body || { error: "no_me" });
+
+    const { sender_id } = req.body || {};
+    if (!sender_id) return res.status(400).json({ error: "missing_sender_id" });
+
+    // Refresh/Access-Token des Followers persistieren (wie bei share/start)
+    const rtHeader = (req.headers["x-refresh-token"] || "").toString() || null;
+    const atHeader = (req.headers.authorization || "").replace(/^Bearer\s+/i, "") || null;
+    await pool.query(
+      `
+      INSERT INTO users (id, display_name, refresh_token_enc, access_token, access_expires_at, created_at, updated_at, spotify_id)
+      VALUES ($1, $2, $3, $4, now() + interval '55 minutes', now(), now(), $1)
+      ON CONFLICT (id)
+      DO UPDATE SET
+        display_name        = EXCLUDED.display_name,
+        access_token        = EXCLUDED.access_token,
+        access_expires_at   = EXCLUDED.access_expires_at,
+        updated_at          = now(),
+        refresh_token_enc   = COALESCE(EXCLUDED.refresh_token_enc, users.refresh_token_enc),
+        spotify_id          = COALESCE(users.spotify_id, EXCLUDED.spotify_id)
+      `,
+      [who.id, who.name || who.id, rtHeader, atHeader]
+    );
+
+    // In-Memory-Registry aktualisieren
+    if (!followersBySender.has(sender_id)) followersBySender.set(sender_id, new Set());
+    followersBySender.get(sender_id).add(who.id);
+
+    return res.json({ ok: true });
+  } catch (e) {
+    return res.status(500).json({ error: "follow_start_failed" });
+  }
+});
+
+app.post("/follow/stop", async (req, res) => {
+  try {
+    const who = await getCurrentSpotifyId(req, res); // Follower
+    if (who.error) return res.status(who.error.status || 401).json(who.error.body || { error: "no_me" });
+    const { sender_id } = req.body || {};
+    if (!sender_id) return res.status(400).json({ error: "missing_sender_id" });
+    const set = followersBySender.get(sender_id);
+    if (set) set.delete(who.id);
+    return res.json({ ok: true });
+  } catch (e) {
+    return res.status(500).json({ error: "follow_stop_failed" });
+  }
+});
+
+
 
 /* ---- Share-Endpoints binden Polling ein ---- */
 app.post("/share/start", async (req, res) => {
