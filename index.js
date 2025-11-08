@@ -34,6 +34,50 @@ const pool = new Pool({
   ssl: useSSL ? { rejectUnauthorized: false } : false,
 });
 
+/* -------------------- Push Helpers ------------------- */
+async function ensurePushTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS push_tokens (
+      user_id TEXT PRIMARY KEY,
+      expo_token TEXT NOT NULL,
+      updated_at TIMESTAMP NOT NULL DEFAULT now()
+    )
+  `);
+}
+async function upsertPushToken(userId, expoToken) {
+  await ensurePushTable();
+  await pool.query(
+    `INSERT INTO push_tokens (user_id, expo_token, updated_at)
+     VALUES ($1, $2, now())
+     ON CONFLICT (user_id) DO UPDATE
+       SET expo_token = EXCLUDED.expo_token,
+           updated_at = now()`,
+    [userId, expoToken]
+  );
+}
+async function getPushTokensForUsers(userIds = []) {
+  if (!userIds.length) return [];
+  await ensurePushTable();
+  const { rows } = await pool.query(
+    `SELECT expo_token FROM push_tokens WHERE user_id = ANY($1)`,
+    [userIds]
+  );
+  return rows.map(r => r.expo_token).filter(Boolean);
+}
+async function sendExpoPush(expoTokens, title, body) {
+  if (!expoTokens.length) return;
+  const payloads = expoTokens.map(to => ({ to, title, body, sound: null, priority: "high" }));
+  try {
+    await axios.post("https://exp.host/--/api/v2/push/send", payloads, {
+      headers: { "Content-Type": "application/json" },
+      timeout: 8000,
+      validateStatus: () => true,
+    });
+  } catch (e) {
+    console.log("[PUSH] send failed:", e.message);
+  }
+}
+
 /* -------------------- Helpers ------------------- */
 function cookieBase(req) {
   const isProd = process.env.NODE_ENV === "production";
@@ -152,6 +196,26 @@ app.get("/health", async (req, res) => {
     dbReason = e.message;
   }
   res.json({ ok: true, db: dbUp, db_reason: dbReason, ts: Date.now(), env: process.env.NODE_ENV || "dev" });
+});
+
+/* -------------------- Push Register ------------------- */
+app.post("/push/register", async (req, res) => {
+  try {
+    const t = await withValidAccessToken(req, res);
+    if (t.error) return res.status(t.error.status).json(t.error.body);
+    const me = await spotifyGet("https://api.spotify.com/v1/me", t.accessToken);
+    if (me.status !== 200) return res.status(401).json({ error: "me_failed" });
+    const userId = me.data.id;
+    const { expo_token } = req.body || {};
+    if (!expo_token || typeof expo_token !== "string") {
+      return res.status(400).json({ error: "missing_expo_token" });
+    }
+    await upsertPushToken(userId, expo_token);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("push/register error:", e.message);
+    res.status(500).json({ error: "push_register_failed" });
+  }
 });
 
 /* -------------------- Auth ---------------------- */
@@ -764,6 +828,31 @@ function stopPollingForSender(senderId, senderName) {
     broadcastPlaystateFalse({ senderId, senderName, trackId: null, progressMs: 0 });
     broadcastSessionEnded(senderId, senderName);
   }
+
+
+  // 👇 NEU: alle aktiven Follower serverseitig PAUSIEREN + Push schicken
+  (async () => {
+    try {
+      const set = followersBySender.get(senderId);
+      const followerIds = set ? Array.from(set) : [];
+      if (followerIds.length) {
+        // 1) Spotify-Pause für jeden Follower
+        await Promise.allSettled(
+          followerIds.map(fid =>
+            spPutForUser(fid, "https://api.spotify.com/v1/me/player/pause", {})
+          )
+        );
+        // 2) Expo Push an diese Follower
+        const tokens = await getPushTokensForUsers(followerIds);
+        if (tokens.length) {
+          await sendExpoPush(tokens, "Session beendet", `${senderName || "Sender"} hat die Live-Session beendet. Spotify wurde pausiert.`);
+        }
+      }
+    } catch (e) {
+      console.log("[END] fanout pause/push failed:", e.message);
+    }
+  })();
+
 }
 
 /* ---- Follow-Registration: Receiver meldet sich/ab ---- */
@@ -894,8 +983,8 @@ app.post("/share/stop", async (req, res) => {
     if (who.error) return res.status(who.error.status || 401).json(who.error.body || { error: "no_me" });
 
     await pool.query(`UPDATE sessions SET is_active = false WHERE sender_spotify_id = $1`, [who.id]);
-    // stopPollingForSender kümmert sich um Pause + Session-Ende Broadcasts
-   stopPollingForSender(who.id, who.name);
+    // stopPollingForSender: WS playstate=false, session/ended, Pause für Follower, Push
+    stopPollingForSender(who.id, who.name);
     res.json({ ok: true });
   } catch (e) {
     console.error("share/stop error:", e.message);
