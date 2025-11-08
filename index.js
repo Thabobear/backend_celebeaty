@@ -597,23 +597,35 @@ function broadcastJSON(obj) {
   });
 }
 
-// kleines Helferlein für Session-Ende
+// Helper: Session-Ende-Event
 function broadcastSessionEnded(senderId, senderName) {
-  broadcastJSON({
+  const payload = {
     type: "session",
     kind: "ended",
     user: { id: senderId, name: senderName || senderId },
     ts: Date.now(),
-  });
+  };
+  try {
+    console.log("[WS] Broadcast session ended →", senderId);
+    broadcastJSON(payload);
+  } catch {}
 }
 
-function broadcastSessionEnded(senderId, senderName) {
-  broadcastJSON({
-    type: "session",
-    kind: "ended",
+// Helper: explizit „playstate=false“ an alle (Receiver filtern selbst)
+function broadcastPlaystateFalse({ senderId, senderName, trackId, progressMs }) {
+  const payload = {
+    type: "track",
+    kind: "playstate",
     user: { id: senderId, name: senderName || senderId },
+    trackId: trackId || null,
+    progress_ms: progressMs || 0,
+    is_playing: false,
     ts: Date.now(),
-  });
+  };
+  try {
+    console.log("[WS] Broadcast playstate=false →", senderId, "track", trackId || "n/a");
+    broadcastJSON(payload);
+  } catch {}
 }
 
 function startPollingForSender(senderId, senderName) {
@@ -731,11 +743,26 @@ function startPollingForSender(senderId, senderName) {
   pollers.set(senderId, { timer, state });
 }
 
-function stopPollingForSender(senderId) {
+function stopPollingForSender(senderId, senderName) {
   const p = pollers.get(senderId);
   if (p) {
+    // vor dem Stoppen ein letztes „Pause“-Signal senden (falls wir noch State haben)
+    const lastTrackId = p.state?.lastTrackId || null;
+    const lastProgress = p.state?.lastProgress || 0;
+    broadcastPlaystateFalse({
+      senderId,
+      senderName,
+      trackId: lastTrackId,
+      progressMs: lastProgress,
+    });
+    // danach Session-Ende signalisieren
+    broadcastSessionEnded(senderId, senderName);
     clearInterval(p.timer);
     pollers.delete(senderId);
+  } else {
+    // Falls kein Poller (z.B. direkte Beendigung), trotzdem Events senden
+    broadcastPlaystateFalse({ senderId, senderName, trackId: null, progressMs: 0 });
+    broadcastSessionEnded(senderId, senderName);
   }
 }
 
@@ -867,9 +894,8 @@ app.post("/share/stop", async (req, res) => {
     if (who.error) return res.status(who.error.status || 401).json(who.error.body || { error: "no_me" });
 
     await pool.query(`UPDATE sessions SET is_active = false WHERE sender_spotify_id = $1`, [who.id]);
-    stopPollingForSender(who.id);
-    // 🔔 allen Clients mitteilen, dass diese Session beendet ist
-    try { broadcastSessionEnded(who.id, who.name); } catch {}
+    // stopPollingForSender kümmert sich um Pause + Session-Ende Broadcasts
+   stopPollingForSender(who.id, who.name);
     res.json({ ok: true });
   } catch (e) {
     console.error("share/stop error:", e.message);
