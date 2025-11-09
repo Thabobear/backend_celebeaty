@@ -675,6 +675,51 @@ function broadcastSessionEnded(senderId, senderName) {
   } catch {}
 }
 
+// Expo Push an alle aktuell registrierten Follower schicken
+async function pushSessionEndedToFollowers(senderId, { senderName, trackId, progressMs }) {
+  try {
+    const set = followersBySender.get(senderId);
+    if (!set || !set.size) return;
+    const followerIds = Array.from(set);
+    const q = await pool.query(
+      `SELECT expo_token FROM push_tokens WHERE user_id = ANY($1::text[])`,
+      [followerIds]
+    );
+    if (!q.rowCount) return;
+    const tokens = q.rows.map(r => r.expo_token).filter(t => /^ExponentPushToken\[\S+\]$/.test(t));
+    if (!tokens.length) return;
+
+    const body = {
+      to: tokens,
+      title: "Session beendet",
+      body: `${senderName || "Sender"} hat die Live-Session beendet. Spotify wurde pausiert.`,
+      data: {
+        type: "session_ended",
+        senderId,
+        trackId: trackId || null,
+        progressMs: progressMs || 0,
+      },
+      sound: null,
+      priority: "high",
+    };
+    // Expo erlaubt Batch-POST mit Array; bei vielen Tokens ggf. in Chunks splitten (<=100)
+    const chunks = [];
+    for (let i = 0; i < tokens.length; i += 100) {
+      chunks.push(tokens.slice(i, i + 100));
+    }
+    for (const group of chunks) {
+      await axios.post(
+        "https://exp.host/--/api/v2/push/send",
+        group.map(t => ({ ...body, to: t })),
+        { timeout: 10000, validateStatus: () => true }
+      );
+    }
+  } catch (e) {
+    console.warn("push fanout failed:", e.message);
+  }
+}
+
+
 // Helper: explizit „playstate=false“ an alle (Receiver filtern selbst)
 function broadcastPlaystateFalse({ senderId, senderName, trackId, progressMs }) {
   const payload = {
@@ -819,6 +864,12 @@ function stopPollingForSender(senderId, senderName) {
       trackId: lastTrackId,
       progressMs: lastProgress,
     });
+    // 🔔 echte Pushes an alle aktuellen Follower
+    pushSessionEndedToFollowers(senderId, {
+      senderName,
+      trackId: lastTrackId,
+      progressMs: lastProgress,
+    });
     // danach Session-Ende signalisieren
     broadcastSessionEnded(senderId, senderName);
     clearInterval(p.timer);
@@ -826,6 +877,7 @@ function stopPollingForSender(senderId, senderName) {
   } else {
     // Falls kein Poller (z.B. direkte Beendigung), trotzdem Events senden
     broadcastPlaystateFalse({ senderId, senderName, trackId: null, progressMs: 0 });
+    pushSessionEndedToFollowers(senderId, { senderName, trackId: null, progressMs: 0 });
     broadcastSessionEnded(senderId, senderName);
   }
 
@@ -1019,6 +1071,36 @@ wss.on("connection", (ws) => {
     }
   });
 });
+
+/* -------------------- Push: Register Token -------------------- */
+app.post("/push/register", async (req, res) => {
+  try {
+    const who = await getCurrentSpotifyId(req, res);
+    if (who.error) return res.status(who.error.status || 401).json(who.error.body || { error: "no_me" });
+
+    const token = (req.body && req.body.token) ? String(req.body.token) : "";
+    if (!token) return res.status(400).json({ error: "missing_token" });
+    // einfache Validierung: Expo Push Tokens starten i.d.R. mit "ExponentPushToken["
+    if (!/^ExponentPushToken\[\S+\]$/.test(token)) {
+      return res.status(400).json({ error: "invalid_token_format" });
+    }
+
+    await pool.query(
+      `
+      INSERT INTO push_tokens (user_id, expo_token, created_at, last_seen_at)
+      VALUES ($1, $2, now(), now())
+      ON CONFLICT (user_id, expo_token)
+      DO UPDATE SET last_seen_at = now()
+      `,
+      [who.id, token]
+    );
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("push/register error:", e.message);
+    return res.status(500).json({ error: "push_register_failed" });
+  }
+});
+
 
 /* -------------------- Start ------------------------------ */
 const PORT = process.env.PORT || 3001;
