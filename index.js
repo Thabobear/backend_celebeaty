@@ -1044,6 +1044,37 @@ app.post("/share/stop", async (req, res) => {
   }
 });
 
+
+
+/* -------------------- Sender-Status (aktueller Track) -------------------- */
+app.get("/sender/current", async (req, res) => {
+  try {
+    const senderId = req.query.id || null;
+    if (!senderId) {
+      return res.status(400).json({ error: "missing_sender_id" });
+    }
+
+    const poller = pollers.get(senderId);
+    if (!poller || !poller.state || !poller.state.lastTrackId) {
+      return res.status(404).json({ error: "no_active_session" });
+    }
+
+    const s = poller.state;
+    return res.json({
+      ok: true,
+      track: {
+        id: s.lastTrackId,
+        progress_ms: s.lastProgress || 0,
+        is_playing: !!s.lastIsPlaying,
+      },
+    });
+  } catch (e) {
+    console.error("sender/current error:", e.message);
+    res.status(500).json({ error: "sender_current_failed" });
+  }
+});
+
+
 /* -------------------- Static + SPA Fallback -------------- */
 app.use(express.static(path.join(__dirname, "public")));
 app.get("*", (req, res) => {
