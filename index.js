@@ -19,10 +19,17 @@ console.log("[DB] Using:", safeUrl, "ssl=", process.env.DB_SSL);
 
 const app = express();
 
+
 /* -------------------- Basics -------------------- */
 app.set("trust proxy", 1);
 app.use(express.json());
 app.use(cookieParser());
+
+
+// ---- Tuning: Seek-Erkennung nur bei großen Sprüngen
+// ENV überschreibbar: SEEK_MIN_MS=7000 z.B. für 7s
+const SEEK_MIN_MS = Number(process.env.SEEK_MIN_MS || 5000); // >=5s Sprung => seek-Event
+
 
 /* -------------------- DB Pool ------------------- */
 const dbUrl = process.env.DATABASE_URL || "";
@@ -811,11 +818,11 @@ function startPollingForSender(senderId, senderName) {
 
       const trackChanged = trackId !== state.lastTrackId;
       const playStateChanged = (is_playing ? 1 : 0) !== (state.lastIsPlaying ? 1 : 0);
-      let seekDetected = false;
-      if (!trackChanged && !playStateChanged) {
-        const delta = Math.abs(progress - (state.lastProgress || 0));
-        seekDetected = delta > 3000 || ((state.lastProgress || 0) - progress) > 1500;
-      }
+      // Nur "echte" Sprünge melden: absolute Differenz >= SEEK_MIN_MS
+      const seekDetected =
+        !trackChanged &&
+        !playStateChanged &&
+        Math.abs(progress - (state.lastProgress || 0)) >= SEEK_MIN_MS;
 
       const now = Date.now();
       const needKeepalive = now - (state.lastKeepalive || 0) > 15000;
@@ -838,7 +845,7 @@ function startPollingForSender(senderId, senderName) {
         fanoutToFollowers(senderId, msg);
         // persistieren (nur „relevante“ Events)
         await storePlaybackEvent({
-          sender_id: senderId, kind: "trackchange", track_id: trackId,
+          sender_id: senderId, kind: "playstate", track_id: trackId,
           progress_ms: progress, is_playing, name: msg.name, artists: msg.artists, image: msg.image, ts_ms: now
         });
       } else if (playStateChanged) {
