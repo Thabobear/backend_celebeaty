@@ -844,6 +844,32 @@ function startPollingForSender(senderId, senderName) {
       state.lastTrackId = trackId;
       state.lastIsPlaying = is_playing;
       state.lastProgress = progress;
+
+ // 🩵 FIX: Wenn Spotify nach längerer Pause "aufwacht" → fehlendes Play-Event nachreichen
+     if (!state.hasAnnouncedResume && is_playing && !trackChanged) {
+       const since = Date.now() - (state.lastKeepalive || 0);
+       if (since > 10000) {
+         console.log(`[Celebeaty] Detected resume after long pause → broadcast playstate:true for ${senderName}`);
+         const msg = {
+           type: "track",
+           kind: "playstate",
+           user: { id: senderId, name: senderName || senderId },
+           trackId,
+           progress_ms: progress,
+           name: item.name,
+           artists: (item.artists || []).map(a => a.name),
+           image: item.album?.images?.[0]?.url || null,
+           is_playing: true,
+           ts: Date.now(),
+         };
+         broadcastJSON(msg);
+         fanoutToFollowers(senderId, msg);
+         state.hasAnnouncedResume = true;
+       }
+     } else if (!is_playing) {
+       state.hasAnnouncedResume = false; // reset, damit nächster Resume erkannt wird
+     }
+
     } catch (e) {
       // leise weiter
     }
