@@ -34,6 +34,28 @@ const pool = new Pool({
   ssl: useSSL ? { rejectUnauthorized: false } : false,
 });
 
+/* -------------------- Playback-Event Storage ------------------- */
++async function storePlaybackEvent({ sender_id, kind, track_id, progress_ms, is_playing, name, artists, image, ts_ms }) {
+  try {
+    await pool.query(
+      `INSERT INTO public.playback_events
+       (sender_id, kind, track_id, progress_ms, is_playing, name, artists, image, ts_ms)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+      [
+        sender_id,
+        kind,
+        track_id,
+        Math.max(0, progress_ms||0),
+        !!is_playing,
+        name || null,
+        artists || [],
+        image || null,
+        ts_ms || Math.round(Date.now())
+      ]
+    );
+  } catch (e) { console.warn("[STORE] playback_events insert failed:", e.message); }
+}
+
 /* -------------------- Push Helpers ------------------- */
 async function ensurePushTable() {
   await pool.query(`
@@ -806,6 +828,11 @@ function startPollingForSender(senderId, senderName) {
 
         broadcastJSON(msg);
         fanoutToFollowers(senderId, msg);
+        // persistieren (nur „relevante“ Events)
+        await storePlaybackEvent({
+          sender_id: senderId, kind: "trackchange", track_id: trackId,
+          progress_ms: progress, is_playing, name: msg.name, artists: msg.artists, image: msg.image, ts_ms: now
+        });
       } else if (playStateChanged) {
         const msg = {
           type: "track",
@@ -822,6 +849,11 @@ function startPollingForSender(senderId, senderName) {
 
         broadcastJSON(msg);
         fanoutToFollowers(senderId, msg);
+        // persistieren (nur „relevante“ Events)
+        await storePlaybackEvent({
+          sender_id: senderId, kind: "trackchange", track_id: trackId,
+          progress_ms: progress, is_playing, name: msg.name, artists: msg.artists, image: msg.image, ts_ms: now
+        });
       } else if (seekDetected || needKeepalive) {
         const msg = {
           type: "track",
@@ -839,6 +871,12 @@ function startPollingForSender(senderId, senderName) {
         broadcastJSON(msg);
         // keepalive NICHT fanouten (würde zu viel Traffic erzeugen)
         if (needKeepalive) state.lastKeepalive = now;
+        if (seekDetected) {
+          await storePlaybackEvent({
+            sender_id: senderId, kind: "seek", track_id: trackId,
+            progress_ms: progress, is_playing, name: msg.name, artists: msg.artists, image: msg.image, ts_ms: now
+          });
+        }
       }
 
       state.lastTrackId = trackId;
@@ -1070,6 +1108,45 @@ app.post("/share/stop", async (req, res) => {
   }
 });
 
+/* -------------------- Buffer-Feed für Receiver ------------------ */
+// Liefert Events eines Senders nach ID (aufwärts), optional mit LAG (ms),
+// damit Receiver „versetzt“ abspielen können.
+// GET /events/since?sender_id=...&after_id=0&limit=100&lag_ms=800
+app.get("/events/since", async (req, res) => {
+  try {
+    const senderId = String(req.query.sender_id || "").trim();
+    if (!senderId) return res.status(400).json({ error: "missing_sender_id" });
+    const afterId = Number(req.query.after_id || 0);
+    const limit = Math.min(500, Math.max(1, Number(req.query.limit || 100)));
+    const lagMs = Math.max(0, Number(req.query.lag_ms || 800)); // Standard-Puffer 800 ms
+
+    // Nur „relevante“ Events zurückgeben (keine keepalive)
+    const { rows } = await pool.query(
+      `
+      SELECT id, sender_id, kind, track_id, progress_ms, is_playing, name, artists, image,
+             ts_ms, created_at
+      FROM public.playback_events
+      WHERE sender_id = $1
+        AND id > $2
+        AND kind IN ('trackchange','seek','playstate')
+        AND created_at <= now() - ($3 || ' milliseconds')::interval
+      ORDER BY id ASC
+      LIMIT $4
+      `,
+      [senderId, afterId, lagMs, limit]
+    );
+
+    res.json({
+      ok: true,
+      after_id: afterId,
+      count: rows.length,
+      events: rows,
+    });
+  } catch (e) {
+    console.error("/events/since error:", e.message);
+    res.status(500).json({ error: "events_since_failed" });
+  }
+});
 
 
 /* -------------------- Sender-Status (aktueller Track, inkl. Metadaten) --- */
