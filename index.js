@@ -228,11 +228,19 @@ app.post("/push/register", async (req, res) => {
     const me = await spotifyGet("https://api.spotify.com/v1/me", t.accessToken);
     if (me.status !== 200) return res.status(401).json({ error: "me_failed" });
     const userId = me.data.id;
-    const { expo_token } = req.body || {};
-    if (!expo_token || typeof expo_token !== "string") {
+    // akzeptiere { expo_token } ODER { token } aus dem Frontend
+    const expoToken =
+      (req.body && (req.body.expo_token || req.body.token))
+        ? String(req.body.expo_token || req.body.token)
+        : "";
+    if (!expoToken) {
       return res.status(400).json({ error: "missing_expo_token" });
     }
-    await upsertPushToken(userId, expo_token);
+    // einfache Plausibilitätsprüfung
+    if (!/^ExponentPushToken\[\S+\]$/.test(expoToken)) {
+      return res.status(400).json({ error: "invalid_token_format" });
+    }
+    await upsertPushToken(userId, expoToken);
     res.json({ ok: true });
   } catch (e) {
     console.error("push/register error:", e.message);
@@ -851,7 +859,7 @@ function startPollingForSender(senderId, senderName) {
         fanoutToFollowers(senderId, msg);
         // persistieren (nur „relevante“ Events)
         await storePlaybackEvent({
-          sender_id: senderId, kind: "trackchange", track_id: trackId,
+          sender_id: senderId, kind: "playstate", track_id: trackId,
           progress_ms: progress, is_playing, name: msg.name, artists: msg.artists, image: msg.image, ts_ms: now
         });
       } else if (seekDetected || needKeepalive) {
@@ -1120,22 +1128,55 @@ app.get("/events/since", async (req, res) => {
     const limit = Math.min(500, Math.max(1, Number(req.query.limit || 100)));
     const lagMs = Math.max(0, Number(req.query.lag_ms || 800)); // Standard-Puffer 800 ms
 
-    // Nur „relevante“ Events zurückgeben (keine keepalive)
+    // Relevante Events + Dedupe/Konsolidierung:
+    // - nur Kanten bei playstate (Änderung von is_playing)
+    // - seek-Events pro Track auf >=600ms Abstand drosseln
     const { rows } = await pool.query(
       `
-      SELECT id, sender_id, kind, track_id, progress_ms, is_playing, name, artists, image,
-             ts_ms, created_at
-      FROM public.playback_events
-      WHERE sender_id = $1
-        AND id > $2
-        AND kind IN ('trackchange','seek','playstate')
-        AND created_at <= now() - ($3 || ' milliseconds')::interval
+      WITH base AS (
+        SELECT id, sender_id, kind, track_id, progress_ms, is_playing, name, artists, image,
+               ts_ms, created_at
+        FROM public.playback_events
+        WHERE sender_id = $1
+          AND id > $2
+          AND kind IN ('trackchange','seek','playstate')
+          AND created_at <= now() - ($3 || ' milliseconds')::interval
+        ORDER BY id ASC
+      ),
+      dedup_playstate AS (
+        SELECT *
+        FROM (
+          SELECT b.*,
+                 LAG(is_playing) OVER (ORDER BY id)         AS prev_is_playing,
+                 LAG(kind)       OVER (ORDER BY id)         AS prev_kind
+          FROM base b
+        ) t
+        WHERE
+          -- immer behalten:
+          kind <> 'playstate'
+          -- nur Play/Pause-Kanten (echter Wechsel):
+          OR (prev_is_playing IS DISTINCT FROM is_playing)
+      ),
+      thin_seek AS (
+        SELECT *
+        FROM (
+          SELECT d.*,
+                 -- letzter Seek-Zeitstempel pro Track
+                 LAG(ts_ms) FILTER (WHERE kind = 'seek')
+                   OVER (PARTITION BY track_id ORDER BY id) AS prev_seek_ts
+          FROM dedup_playstate d
+        ) s
+        WHERE
+          -- nur seeks mit >=600ms Abstand, alles andere durchlassen
+          kind <> 'seek' OR prev_seek_ts IS NULL OR (ts_ms - prev_seek_ts) > 600
+      )
+      SELECT id, sender_id, kind, track_id, progress_ms, is_playing, name, artists, image, ts_ms, created_at
+      FROM thin_seek
       ORDER BY id ASC
       LIMIT $4
       `,
       [senderId, afterId, lagMs, limit]
     );
-
     res.json({
       ok: true,
       after_id: afterId,
@@ -1209,35 +1250,6 @@ wss.on("connection", (ws) => {
       try { ws.send(JSON.stringify({ type: "listener_count", count, ts: Date.now() })); } catch {}
     }
   });
-});
-
-/* -------------------- Push: Register Token -------------------- */
-app.post("/push/register", async (req, res) => {
-  try {
-    const who = await getCurrentSpotifyId(req, res);
-    if (who.error) return res.status(who.error.status || 401).json(who.error.body || { error: "no_me" });
-
-    const token = (req.body && req.body.token) ? String(req.body.token) : "";
-    if (!token) return res.status(400).json({ error: "missing_token" });
-    // einfache Validierung: Expo Push Tokens starten i.d.R. mit "ExponentPushToken["
-    if (!/^ExponentPushToken\[\S+\]$/.test(token)) {
-      return res.status(400).json({ error: "invalid_token_format" });
-    }
-
-    await pool.query(
-      `
-      INSERT INTO push_tokens (user_id, expo_token, created_at, last_seen_at)
-      VALUES ($1, $2, now(), now())
-      ON CONFLICT (user_id, expo_token)
-      DO UPDATE SET last_seen_at = now()
-      `,
-      [who.id, token]
-    );
-    return res.json({ ok: true });
-  } catch (e) {
-    console.error("push/register error:", e.message);
-    return res.status(500).json({ error: "push_register_failed" });
-  }
 });
 
 
