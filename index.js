@@ -1043,7 +1043,7 @@ function startPollingForSender(senderId, senderName) {
   pollers.set(senderId, { timer, state });
 }
 
-function stopPollingForSender(senderId, senderName) {
+async function stopPollingForSender(senderId, senderName) {
   const p = pollers.get(senderId);
   if (p) {
     // vor dem Stoppen ein letztes „Pause“-Signal senden (falls wir noch State haben)
@@ -1079,9 +1079,15 @@ function stopPollingForSender(senderId, senderName) {
   // (Optional, aber empfohlen) Pause-Kante persistieren, damit DB-Consumer sie sehen
   try {
     await storePlaybackEvent({
-      sender_id: senderId, kind: "playstate", track_id: p?.state?.lastTrackId || null,
-      progress_ms: p?.state?.lastProgress || 0, is_playing: false,
-      name: null, artists: [], image: null, ts_ms: Date.now()
+      sender_id: senderId,
+      kind: "playstate",
+      track_id: p?.state?.lastTrackId || null,
+      progress_ms: p?.state?.lastProgress || 0,
+      is_playing: false,
+      name: null,
+      artists: [],
+      image: null,
+      ts_ms: Date.now(),
     });
   } catch (e) { /* ruhig */ }
 
@@ -1246,7 +1252,7 @@ app.post("/share/stop", async (req, res) => {
 
     await pool.query(`UPDATE sessions SET is_active = false WHERE sender_spotify_id = $1`, [who.id]);
     // stopPollingForSender: WS playstate=false, session/ended, Pause für Follower, Push
-    stopPollingForSender(who.id, who.name);
+    await stopPollingForSender(who.id, who.name);
     res.json({ ok: true });
   } catch (e) {
     console.error("share/stop error:", e.message);
