@@ -235,6 +235,19 @@ app.get("/health", async (req, res) => {
   res.json({ ok: true, db: dbUp, db_reason: dbReason, ts: Date.now(), env: process.env.NODE_ENV || "dev" });
 });
 
+// ===== Debug: Direktabfrage für einen Sender-Account
+app.get("/__debug/sender-now", async (req, res) => {
+  try {
+    const senderId = String(req.query.sender_id || "").trim();
+    if (!senderId) return res.status(400).json({ error: "missing_sender_id" });
+    const at = await getFreshTokenForUser(senderId);
+    const r = await spotifyGet("https://api.spotify.com/v1/me/player/currently-playing", at);
+    return res.status(200).json({ status: r.status, data: r.data || null });
+  } catch (e) {
+    return res.status(500).json({ error: "debug_sender_now_failed", message: e.message });
+  }
+});
+
 /* -------------------- Push Register ------------------- */
 app.post("/push/register", async (req, res) => {
   try {
@@ -890,12 +903,20 @@ function startPollingForSender(senderId, senderName) {
     lastKeepalive: 0,
   };
 
+  console.log(`[POLL] startPollingForSender for ${senderName} (${senderId})`);
+
   const timer = setInterval(async () => {
     try {
       const at = await getFreshTokenForUser(senderId);
       const r = await spotifyGet("https://api.spotify.com/v1/me/player/currently-playing", at);
+      if (r.status !== 200 && r.status !== 204) {
+        console.warn(`[POLL] ${senderId} currently-playing status=${r.status}`, r.data || "");
+      }
 
       if (r.status === 204 || !r.data || !r.data.item) {
+        // 204 oder kein item: kann Werbung, private session, inaktives Gerät etc. sein
+        const why = r?.data?.currently_playing_type || "no_item";
+        console.log(`[POLL] ${senderId} no item (status=${r.status}) reason=${why}`);
         if (state.lastTrackId && state.lastIsPlaying === true) {
           broadcastJSON({
             type: "track",
@@ -913,9 +934,13 @@ function startPollingForSender(senderId, senderName) {
 
       const data = r.data;
       const item = data.item;
+      if (!item) {
+        console.log(`[POLL] ${senderId} has data but no item. type=${data.currently_playing_type} is_playing=${data.is_playing}`);
+      }
       const trackId = item.id;
       const progress = data.progress_ms || 0;
       const is_playing = !!data.is_playing;
+      console.log(`[POLL] ${senderId} item=${trackId} play=${is_playing} @${progress}ms type=${data.currently_playing_type}`);
 
       await pool.query(
         `UPDATE sessions SET last_snapshot_at = now() WHERE sender_spotify_id = $1 AND is_active = true`,
@@ -954,6 +979,7 @@ function startPollingForSender(senderId, senderName) {
           sender_id: senderId, kind: "trackchange", track_id: trackId,
           progress_ms: progress, is_playing, name: msg.name, artists: msg.artists, image: msg.image, ts_ms: now
         });
+        console.log(`[EVT][STORE] trackchange ${senderId} ${trackId} @${progress}`);
       } else if (playStateChanged) {
         const msg = {
           type: "track",
@@ -975,6 +1001,7 @@ function startPollingForSender(senderId, senderName) {
           sender_id: senderId, kind: "playstate", track_id: trackId,
           progress_ms: progress, is_playing, name: msg.name, artists: msg.artists, image: msg.image, ts_ms: now
         });
+        console.log(`[EVT][STORE] playstate ${senderId} is_playing=${is_playing} @${progress}`);
       } else if (seekDetected || needKeepalive) {
         const msg = {
           type: "track",
@@ -997,6 +1024,7 @@ function startPollingForSender(senderId, senderName) {
             sender_id: senderId, kind: "seek", track_id: trackId,
             progress_ms: progress, is_playing, name: msg.name, artists: msg.artists, image: msg.image, ts_ms: now
           });
+          console.log(`[EVT][STORE] seek ${senderId} ${trackId} @${progress}`);
         }
       }
 
@@ -1036,7 +1064,7 @@ function startPollingForSender(senderId, senderName) {
      }
 
     } catch (e) {
-      // leise weiter
+      console.warn(`[POLL][ERR] ${senderId} ${e?.message || e}`);
     }
   }, 2000);
 
@@ -1322,6 +1350,7 @@ app.get("/events/since", async (req, res) => {
       [senderId, afterId, lagMs, limit]
     );
     res.json({
+      console.log(`[EVT][SINCE] sender=${senderId} after_id=${afterId} lag=${lagMs}ms -> ${rows.length} evts`);
       ok: true,
       after_id: afterId,
       count: rows.length,
