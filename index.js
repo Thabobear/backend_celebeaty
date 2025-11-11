@@ -845,7 +845,7 @@ function startPollingForSender(senderId, senderName) {
         fanoutToFollowers(senderId, msg);
         // persistieren (nur „relevante“ Events)
         await storePlaybackEvent({
-          sender_id: senderId, kind: "playstate", track_id: trackId,
+          sender_id: senderId, kind: "trackchange", track_id: trackId,
           progress_ms: progress, is_playing, name: msg.name, artists: msg.artists, image: msg.image, ts_ms: now
         });
       } else if (playStateChanged) {
