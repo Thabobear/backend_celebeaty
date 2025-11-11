@@ -721,7 +721,7 @@ async function alignFollowerPlayback(followerId, { trackId, progress, shouldPlay
       : {};
     await spPutForUser(followerId, "https://api.spotify.com/v1/me/player/play", body);
   } catch (e) {
-    // leise: 403/404 typischerweise wenn kein aktives Device / Spotify nicht bereit
+    console.warn(`[ALIGN][ERR] follower=${followerId} track=${trackId} play=${shouldPlay} pos=${progress}ms force=${forcePosition} → ${e?.message || e}`);
   }
 }
 
@@ -774,7 +774,8 @@ function startDbReplayer(senderId, followerId) {
         `,
         [senderId, state.afterId, REPLAY_LAG_MS]
       );
-      if (!rows.length) return;
+      if (!rows.length) { /* keine neuen Events */ return; }
+      console.log(`[REPLAY] ${senderId}→${followerId} fetched ${rows.length} evts after_id=${state.afterId} lag=${REPLAY_LAG_MS}ms`);
 
       // Nur das letzte Event anwenden
       const ev = rows[rows.length - 1];
@@ -802,7 +803,10 @@ function startDbReplayer(senderId, followerId) {
         shouldPlay,
         forcePosition
       });
-    } catch (_) { /* ruhig bleiben */ }
+      console.log(`[REPLAY][APPLY] ${senderId}→${followerId} ${kind} track=${trackId} pos=${effective}ms play=${shouldPlay} force=${forcePosition}`);
+    } catch (e) {
+      console.warn(`[REPLAY][ERR] ${senderId}→${followerId}: ${e?.message || e}`);
+    }
   };
 
   const timer = setInterval(tick, REPLAY_POLL_MS);
@@ -1193,6 +1197,11 @@ app.post("/follow/start", async (req, res) => {
     // Refresh/Access-Token des Followers persistieren (wie bei share/start)
     const rtHeader = (req.headers["x-refresh-token"] || "").toString() || null;
     const atHeader = (req.headers.authorization || "").replace(/^Bearer\s+/i, "") || null;
+    // ⬇️  NEU: Cookie-Fallback, damit Web-Client Tokens persistiert
+    const rtCookie = (req.cookies?.sp_rt || null);
+    const atCookie = (req.cookies?.sp_at || null);
+    const rt = rtHeader || rtCookie;
+    const at = atHeader || atCookie;
     await pool.query(
       `
       INSERT INTO users (id, display_name, refresh_token_enc, access_token, access_expires_at, created_at, updated_at, spotify_id)
@@ -1206,7 +1215,7 @@ app.post("/follow/start", async (req, res) => {
         refresh_token_enc   = COALESCE(EXCLUDED.refresh_token_enc, users.refresh_token_enc),
         spotify_id          = COALESCE(users.spotify_id, EXCLUDED.spotify_id)
       `,
-      [who.id, who.name || who.id, rtHeader, atHeader]
+      [who.id, who.name || who.id, rt, at]
     );
 
     // In-Memory-Registry aktualisieren
@@ -1215,6 +1224,7 @@ app.post("/follow/start", async (req, res) => {
 
     // ➜ DB-Replayer für diesen (sender, follower) starten
     startDbReplayer(sender_id, who.id);
+    console.log(`[FOLLOW] start follower=${who.id} sender=${sender_id} rt=${!!rt} at=${!!at}`);
 
     return res.json({ ok: true });
   } catch (e) {
@@ -1248,6 +1258,10 @@ app.post("/share/start", async (req, res) => {
 
     const rtHeader = (req.headers["x-refresh-token"] || "").toString() || null;
     const atHeader = (req.headers.authorization || "").replace(/^Bearer\s+/i, "") || null;
+    const rtCookie = (req.cookies?.sp_rt || null);
+    const atCookie = (req.cookies?.sp_at || null);
+    const rt = rtHeader || rtCookie;
+    const at = atHeader || atCookie;
 
     // User auf PRIMARY KEY "id" upserten (FK der sessions zeigt auf users.id)
     await pool.query(
@@ -1263,7 +1277,7 @@ app.post("/share/start", async (req, res) => {
         refresh_token_enc   = COALESCE(EXCLUDED.refresh_token_enc, users.refresh_token_enc),
         spotify_id          = COALESCE(users.spotify_id, EXCLUDED.spotify_id)
       `,
-      [who.id, who.name || who.id, rtHeader, atHeader]
+      [who.id, who.name || who.id, rt, at]
     );
 
     // Prüfen anhand users.id (nicht spotify_id)
