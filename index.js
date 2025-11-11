@@ -19,6 +19,14 @@ console.log("[DB] Using:", safeUrl, "ssl=", process.env.DB_SSL);
 
 const app = express();
 
+// ---- Serverseitige Steuerung aus DB-Events ----
+// Live-Fanout per Direct-API (optional; standardmäßig AUS – vermeidet Doppelsteuerung)
+const SERVER_FANOUT = process.env.SERVER_FANOUT === "1";
+// DB-Replayer (Server steuert Follower aus der Event-Tabelle)
+const REPLAY_POLL_MS = Number(process.env.REPLAY_POLL_MS || 600);   // 0.6 s
+const REPLAY_LAG_MS  = Number(process.env.REPLAY_LAG_MS  || 1000);  // 0.8–1.5 s ist sweet spot
+// Registry: pro (senderId:followerId) ein Timer
+const replayers = new Map(); // key: `${senderId}:${followerId}` -> { timer, afterId }
 
 /* -------------------- Basics -------------------- */
 app.set("trust proxy", 1);
@@ -670,6 +678,104 @@ async function alignFollowerPlayback(followerId, { trackId, progress, shouldPlay
   }
 }
 
+/** DB-Event-Replayer: folgt den gespeicherten Events des Senders für genau einen Follower */
+function startDbReplayer(senderId, followerId) {
+  const key = `${senderId}:${followerId}`;
+  if (replayers.has(key)) return;
+  const state = { afterId: 0 };
+
+  const tick = async () => {
+    try {
+      // Follower noch registriert?
+      const set = followersBySender.get(senderId);
+      if (!set || !set.has(followerId)) { stopDbReplayer(senderId, followerId); return; }
+
+      // Neueste relevanten Events seit afterId, mit Lag
+      const { rows } = await pool.query(
+        `
+        WITH base AS (
+          SELECT id, sender_id, kind, track_id, progress_ms, is_playing, name, artists, image, ts_ms, created_at
+          FROM public.playback_events
+          WHERE sender_id = $1
+            AND id > $2
+            AND kind IN ('trackchange','seek','playstate')
+            AND created_at <= now() - ($3 || ' milliseconds')::interval
+          ORDER BY id ASC
+          LIMIT 100
+        ),
+        dedup_playstate AS (
+          SELECT *
+          FROM (
+            SELECT b.*,
+                   LAG(is_playing) OVER (ORDER BY id) AS prev_is_playing
+            FROM base b
+          ) t
+          WHERE kind <> 'playstate' OR (prev_is_playing IS DISTINCT FROM is_playing)
+        ),
+        thin_seek AS (
+          SELECT *
+          FROM (
+            SELECT d.*,
+                   LAG(ts_ms) FILTER (WHERE kind = 'seek')
+                     OVER (PARTITION BY track_id ORDER BY id) AS prev_seek_ts
+            FROM dedup_playstate d
+          ) s
+          WHERE kind <> 'seek' OR prev_seek_ts IS NULL OR (ts_ms - prev_seek_ts) > 600
+        )
+        SELECT * FROM thin_seek
+        ORDER BY id ASC
+        `,
+        [senderId, state.afterId, REPLAY_LAG_MS]
+      );
+      if (!rows.length) return;
+
+      // Nur das letzte Event anwenden
+      const ev = rows[rows.length - 1];
+      state.afterId = Math.max(state.afterId, Number(ev.id || 0));
+
+      const kind = ev.kind;
+      const trackId = ev.track_id;
+      if (!trackId) return;
+
+      // Effektive Zielposition aus Eventzeit + Drift
+      const now = Date.now();
+      const base = Math.max(0, ev.progress_ms || 0);
+      const drift = Math.max(0, now - (ev.ts_ms || now));
+      const effective = Math.floor(base + drift);
+
+      let forcePosition = false;
+      let shouldPlay = true;
+      if (kind === 'trackchange') { forcePosition = true;  shouldPlay = true; }
+      else if (kind === 'seek')   { forcePosition = true;  shouldPlay = true; }
+      else if (kind === 'playstate') { forcePosition = false; shouldPlay = !!ev.is_playing; }
+
+      await alignFollowerPlayback(followerId, {
+        trackId,
+        progress: effective,
+        shouldPlay,
+        forcePosition
+      });
+    } catch (_) { /* ruhig bleiben */ }
+  };
+
+  const timer = setInterval(tick, REPLAY_POLL_MS);
+  replayers.set(key, { timer, afterId: 0 });
+}
+
+function stopDbReplayer(senderId, followerId) {
+  const key = `${senderId}:${followerId}`;
+  const r = replayers.get(key);
+  if (r) { clearInterval(r.timer); replayers.delete(key); }
+}
+
+function stopAllReplayersForSender(senderId) {
+  const keys = Array.from(replayers.keys()).filter(k => k.startsWith(`${senderId}:`));
+  for (const k of keys) {
+    try { clearInterval(replayers.get(k).timer); } catch {}
+    replayers.delete(k);
+  }
+}
+
 /** Follower eines Senders synchronisieren (nur auf „relevante“ Events reagieren) */
 async function fanoutToFollowers(senderId, payload) {
   const set = followersBySender.get(senderId);
@@ -967,6 +1073,20 @@ function stopPollingForSender(senderId, senderName) {
   }
 
 
+  // ➜ Alle DB-Replayer dieses Senders stoppen
+  stopAllReplayersForSender(senderId);
+
+  // (Optional, aber empfohlen) Pause-Kante persistieren, damit DB-Consumer sie sehen
+  try {
+    await storePlaybackEvent({
+      sender_id: senderId, kind: "playstate", track_id: p?.state?.lastTrackId || null,
+      progress_ms: p?.state?.lastProgress || 0, is_playing: false,
+      name: null, artists: [], image: null, ts_ms: Date.now()
+    });
+  } catch (e) { /* ruhig */ }
+
+
+
   // 👇 NEU: alle aktiven Follower serverseitig PAUSIEREN + Push schicken
   (async () => {
     try {
@@ -1024,6 +1144,9 @@ app.post("/follow/start", async (req, res) => {
     if (!followersBySender.has(sender_id)) followersBySender.set(sender_id, new Set());
     followersBySender.get(sender_id).add(who.id);
 
+    // ➜ DB-Replayer für diesen (sender, follower) starten
+    startDbReplayer(sender_id, who.id);
+
     return res.json({ ok: true });
   } catch (e) {
     return res.status(500).json({ error: "follow_start_failed" });
@@ -1038,6 +1161,8 @@ app.post("/follow/stop", async (req, res) => {
     if (!sender_id) return res.status(400).json({ error: "missing_sender_id" });
     const set = followersBySender.get(sender_id);
     if (set) set.delete(who.id);
+    // ➜ Replayer stoppen
+    stopDbReplayer(sender_id, who.id);
     return res.json({ ok: true });
   } catch (e) {
     return res.status(500).json({ error: "follow_stop_failed" });
