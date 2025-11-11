@@ -917,6 +917,12 @@ function startPollingForSender(senderId, senderName) {
          };
          broadcastJSON(msg);
          if (SERVER_FANOUT) fanoutToFollowers(senderId, msg);
+         // ❗ WICHTIG: auch in DB persistieren, damit /events/since dieses Playstate bekommt
+         await storePlaybackEvent({
+           sender_id: senderId, kind: "playstate", track_id: trackId,
+           progress_ms: progress, is_playing: true,
+           name: msg.name, artists: msg.artists, image: msg.image, ts_ms: msg.ts
+         });
          state.hasAnnouncedResume = true;
        }
      } else if (!is_playing) {
