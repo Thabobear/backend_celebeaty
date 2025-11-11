@@ -842,7 +842,7 @@ function startPollingForSender(senderId, senderName) {
         };
 
         broadcastJSON(msg);
-        fanoutToFollowers(senderId, msg);
+        if (SERVER_FANOUT) fanoutToFollowers(senderId, msg);
         // persistieren (nur „relevante“ Events)
         await storePlaybackEvent({
           sender_id: senderId, kind: "trackchange", track_id: trackId,
@@ -863,7 +863,7 @@ function startPollingForSender(senderId, senderName) {
         };
 
         broadcastJSON(msg);
-        fanoutToFollowers(senderId, msg);
+        if (SERVER_FANOUT) fanoutToFollowers(senderId, msg);
         // persistieren (nur „relevante“ Events)
         await storePlaybackEvent({
           sender_id: senderId, kind: "playstate", track_id: trackId,
@@ -916,7 +916,7 @@ function startPollingForSender(senderId, senderName) {
            ts: Date.now(),
          };
          broadcastJSON(msg);
-         fanoutToFollowers(senderId, msg);
+         if (SERVER_FANOUT) fanoutToFollowers(senderId, msg);
          state.hasAnnouncedResume = true;
        }
      } else if (!is_playing) {
