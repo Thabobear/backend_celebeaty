@@ -746,7 +746,7 @@ function startDbReplayer(senderId, followerId) {
           WHERE sender_id = $1
             AND id > $2
             AND kind IN ('trackchange','seek','playstate')
-            AND created_at <= now() - ($3 || ' milliseconds')::interval
+            AND created_at <= now() - ($3::text || ' milliseconds')::interval
           ORDER BY id ASC
           LIMIT 100
         ),
@@ -844,6 +844,7 @@ async function fanoutToFollowers(senderId, payload) {
 
 function broadcastJSON(obj) {
   const msg = JSON.stringify(obj);
+  if (!globalThis.wss || !wss.clients) return;
   wss.clients.forEach((c) => {
     if (c.readyState === WebSocket.OPEN) {
       try { c.send(msg); } catch {}
@@ -1346,7 +1347,7 @@ app.get("/events/since", async (req, res) => {
         WHERE sender_id = $1
           AND id > $2
           AND kind IN ('trackchange','seek','playstate')
-          AND created_at <= now() - ($3 || ' milliseconds')::interval
+          AND created_at <= now() - ($3::text || ' milliseconds')::interval
         ORDER BY id ASC
       ),
       dedup_playstate AS (
