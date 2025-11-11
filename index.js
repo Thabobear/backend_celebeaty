@@ -763,8 +763,13 @@ function startDbReplayer(senderId, followerId) {
           SELECT *
           FROM (
             SELECT d.*,
-                   LAG(ts_ms) FILTER (WHERE kind = 'seek')
-                     OVER (PARTITION BY track_id ORDER BY id) AS prev_seek_ts
+                   /* Letzter SEEK-Zeitstempel pro Track, vor der aktuellen Zeile */
+                   MAX(CASE WHEN kind = 'seek' THEN ts_ms END)
+                     OVER (
+                       PARTITION BY track_id
+                       ORDER BY id
+                       ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                     ) AS prev_seek_ts
             FROM dedup_playstate d
           ) s
           WHERE kind <> 'seek' OR prev_seek_ts IS NULL OR (ts_ms - prev_seek_ts) > 600
@@ -1382,9 +1387,13 @@ app.get("/events/since", async (req, res) => {
         SELECT *
         FROM (
           SELECT d.*,
-                 -- letzter Seek-Zeitstempel pro Track
-                 LAG(ts_ms) FILTER (WHERE kind = 'seek')
-                   OVER (PARTITION BY track_id ORDER BY id) AS prev_seek_ts
+                 /* letzter Seek-Zeitstempel pro Track (vor aktueller Zeile) */
+                 MAX(CASE WHEN kind = 'seek' THEN ts_ms END)
+                   OVER (
+                     PARTITION BY track_id
+                     ORDER BY id
+                     ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                   ) AS prev_seek_ts
           FROM dedup_playstate d
         ) s
         WHERE
