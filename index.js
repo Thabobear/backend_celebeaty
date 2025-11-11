@@ -1349,8 +1349,12 @@ app.get("/events/since", async (req, res) => {
       `,
       [senderId, afterId, lagMs, limit]
     );
+    console.log(
+      "[EVT][SINCE] sender=" + senderId +
+      " after_id=" + afterId +
+      " lag=" + lagMs + "ms -> " + rows.length + " evts"
+    );
     res.json({
-      console.log(`[EVT][SINCE] sender=${senderId} after_id=${afterId} lag=${lagMs}ms -> ${rows.length} evts`);
       ok: true,
       after_id: afterId,
       count: rows.length,
