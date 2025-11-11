@@ -106,7 +106,7 @@ ensurePlaybackEventsTable()
   .catch((e) => console.warn("[DB] playback_events init error:", e.message));
 
 /* -------------------- Push Helpers ------------------- */
-sync function ensurePushTable() {
+async function ensurePushTable() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS push_tokens (
       user_id TEXT PRIMARY KEY,
