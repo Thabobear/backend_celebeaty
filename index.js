@@ -853,7 +853,7 @@ async function fanoutToFollowers(senderId, payload) {
 
 function broadcastJSON(obj) {
   const msg = JSON.stringify(obj);
-  if (!globalThis.wss || !wss.clients) return;
+  if (!wss || !wss.clients) return;
   wss.clients.forEach((c) => {
     if (c.readyState === WebSocket.OPEN) {
       try { c.send(msg); } catch {}
