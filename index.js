@@ -50,7 +50,34 @@ const pool = new Pool({
 });
 
 /* -------------------- Playback-Event Storage ------------------- */
-+async function storePlaybackEvent({ sender_id, kind, track_id, progress_ms, is_playing, name, artists, image, ts_ms }) {
+async function ensurePlaybackEventsTable() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS public.playback_events (
+        id BIGSERIAL PRIMARY KEY,
+        sender_id   TEXT NOT NULL,
+        kind        TEXT NOT NULL CHECK (kind IN ('trackchange','seek','playstate')),
+        track_id    TEXT,
+        progress_ms INTEGER NOT NULL DEFAULT 0,
+        is_playing  BOOLEAN NOT NULL DEFAULT false,
+        name        TEXT,
+        artists     TEXT[],
+        image       TEXT,
+        ts_ms       BIGINT NOT NULL,
+        created_at  TIMESTAMP NOT NULL DEFAULT now()
+      )
+    `);
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS ix_events_sender_id ON public.playback_events(sender_id, id)
+    `);
+  } catch (e) {
+    console.warn("[DB] ensurePlaybackEventsTable failed:", e.message);
+  }
+}
+
+async function storePlaybackEvent({
+  sender_id, kind, track_id, progress_ms, is_playing, name, artists, image, ts_ms
+}) {
   try {
     await pool.query(
       `INSERT INTO public.playback_events
@@ -60,19 +87,26 @@ const pool = new Pool({
         sender_id,
         kind,
         track_id,
-        Math.max(0, progress_ms||0),
+        Math.max(0, Number(progress_ms) || 0),
         !!is_playing,
         name || null,
-        artists || [],
+        Array.isArray(artists) ? artists : (artists ? [String(artists)] : []),
         image || null,
-        ts_ms || Math.round(Date.now())
+        Number.isFinite(ts_ms) ? Math.round(ts_ms) : Math.round(Date.now())
       ]
     );
-  } catch (e) { console.warn("[STORE] playback_events insert failed:", e.message); }
+  } catch (e) {
+    console.warn("[STORE] playback_events insert failed:", e.message);
+  }
 }
 
+// Tabelle beim Start sicherstellen (kein await nötig zum Bootblocken)
+ensurePlaybackEventsTable()
+  .then(() => console.log("[DB] playback_events ready"))
+  .catch((e) => console.warn("[DB] playback_events init error:", e.message));
+
 /* -------------------- Push Helpers ------------------- */
-async function ensurePushTable() {
+sync function ensurePushTable() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS push_tokens (
       user_id TEXT PRIMARY KEY,
