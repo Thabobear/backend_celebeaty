@@ -870,12 +870,13 @@ function broadcastJSON(obj) {
 }
 
 // Helper: Session-Ende-Event
-function broadcastSessionEnded(senderId, senderName) {
+function broadcastSessionEnded(senderId, senderName, reason) {
   const payload = {
     type: "session",
     kind: "ended",
     user: { id: senderId, name: senderName || senderId },
     ts: Date.now(),
+    reason: reason || null,
   };
   try {
     console.log("[WS] Broadcast session ended →", senderId);
@@ -1009,18 +1010,35 @@ function startPollingForSender(senderId, senderName) {
             console.log(`[EVT][STORE] playstate ${senderId} is_playing=false @${state.lastProgress || 0}`);
           } catch {}
           state.lastIsPlaying = false;
+          state.wasSilentlyPaused = true; // merken: Pause kam aus „Silence“
           // kein Reset von noItemSince – wir bleiben in „Pause“, bis wieder ein echtes Item kommt
         }
 
-        // Harte Kante: sehr lange Pause → Session sauber beenden
-        if (silentFor >= PAUSE_TIMEOUT_MS) {
-          console.log(`[POLL] ${senderId} Pause >= ${PAUSE_TIMEOUT_MS}ms → stopPolling`);
-          await stopPollingForSender(senderId, senderName);
+        // Harte Kante: sehr lange Pause → Session sauber beenden (einmalig)
+        if (silentFor >= PAUSE_TIMEOUT_MS && !state.timedOut) {
+         state.timedOut = true;
+          console.log(
+            `[POLL] ${senderId} Pause >= ${PAUSE_TIMEOUT_MS}ms → stopPolling (timeout)`
+          );
+          // Push an den Sender: „zu lange pausiert“
+          try {
+            const tokens = await getPushTokensForUsers([senderId]);
+            if (tokens.length) {
+              await sendExpoPush(
+                tokens,
+                "Session beendet",
+                "Zu lange pausiert – deine Live-Session wurde beendet."
+              );
+            }
+          } catch {}
+          // Session beenden und Grund mitschicken
+          await stopPollingForSender(senderId, senderName, "timeout");
         }
         return;
       } else {
         // wir haben wieder ein echtes Item → Stille-Timer zurücksetzen
         state.noItemSince = 0;
+        state.timedOut = false; // Reset, weil wieder ein echtes Item da ist
       }
 
       const data = r.data;
@@ -1162,7 +1180,7 @@ function startPollingForSender(senderId, senderName) {
   pollers.set(senderId, { timer, state });
 }
 
-async function stopPollingForSender(senderId, senderName) {
+async function stopPollingForSender(senderId, senderName, reason = null) {
   const p = pollers.get(senderId);
   if (p) {
     // vor dem Stoppen ein letztes „Pause“-Signal senden (falls wir noch State haben)
@@ -1181,14 +1199,14 @@ async function stopPollingForSender(senderId, senderName) {
       progressMs: lastProgress,
     });
     // danach Session-Ende signalisieren
-    broadcastSessionEnded(senderId, senderName);
+    broadcastSessionEnded(senderId, senderName, reason);
     clearInterval(p.timer);
     pollers.delete(senderId);
   } else {
     // Falls kein Poller (z.B. direkte Beendigung), trotzdem Events senden
     broadcastPlaystateFalse({ senderId, senderName, trackId: null, progressMs: 0 });
     pushSessionEndedToFollowers(senderId, { senderName, trackId: null, progressMs: 0 });
-    broadcastSessionEnded(senderId, senderName);
+    broadcastSessionEnded(senderId, senderName, reason);
   }
 
 
@@ -1381,7 +1399,7 @@ app.post("/share/stop", async (req, res) => {
 
     await pool.query(`UPDATE sessions SET is_active = false WHERE sender_spotify_id = $1`, [who.id]);
     // stopPollingForSender: WS playstate=false, session/ended, Pause für Follower, Push
-    await stopPollingForSender(who.id, who.name);
+    await stopPollingForSender(who.id, who.name, "manual");
     res.json({ ok: true });
   } catch (e) {
     console.error("share/stop error:", e.message);
