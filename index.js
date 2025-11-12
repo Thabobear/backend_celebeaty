@@ -17,6 +17,8 @@ const rawUrl = process.env.DATABASE_URL || "";
 const safeUrl = rawUrl.replace(/:\/\/([^:@]+):[^@]+@/, "://$1:****@");
 console.log("[DB] Using:", safeUrl, "ssl=", process.env.DB_SSL);
 const PAUSE_GRACE_MS = Number(process.env.PAUSE_GRACE_MS || 5000); // erst nach 5s Stille wirklich „Pause“
+const PAUSE_TIMEOUT_MS = Number(process.env.PAUSE_TIMEOUT_MS || 30000); // 30 s Pause => Session-Ende
+
 
 const app = express();
 
@@ -977,7 +979,7 @@ function startPollingForSender(senderId, senderName) {
           `[POLL] ${senderId} no item (status=${r.status}) reason=${why} silentFor=${silentFor}ms`
         );
 
-        // Nur wenn wirklich LANGE (PAUSE_GRACE_MS) nichts kommt → einmalig Pause broadcasten
+        // Nur wenn wirklich LANGE (PAUSE_GRACE_MS) nichts kommt → einmalig Pause broadcasten & persistieren
         if (
           silentFor >= PAUSE_GRACE_MS &&
           state.lastTrackId &&
@@ -992,10 +994,29 @@ function startPollingForSender(senderId, senderName) {
             is_playing: false,
             ts: nowMs,
           });
+          try {
+            await storePlaybackEvent({
+              sender_id: senderId,
+              kind: "playstate",
+              track_id: state.lastTrackId,
+              progress_ms: state.lastProgress || 0,
+              is_playing: false,
+              name: null,
+              artists: [],
+              image: null,
+              ts_ms: nowMs,
+            });
+            console.log(`[EVT][STORE] playstate ${senderId} is_playing=false @${state.lastProgress || 0}`);
+          } catch {}
           state.lastIsPlaying = false;
           // kein Reset von noItemSince – wir bleiben in „Pause“, bis wieder ein echtes Item kommt
         }
 
+        // Harte Kante: sehr lange Pause → Session sauber beenden
+        if (silentFor >= PAUSE_TIMEOUT_MS) {
+          console.log(`[POLL] ${senderId} Pause >= ${PAUSE_TIMEOUT_MS}ms → stopPolling`);
+          await stopPollingForSender(senderId, senderName);
+        }
         return;
       } else {
         // wir haben wieder ein echtes Item → Stille-Timer zurücksetzen
