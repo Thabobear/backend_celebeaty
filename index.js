@@ -16,6 +16,7 @@ require("dotenv").config();
 const rawUrl = process.env.DATABASE_URL || "";
 const safeUrl = rawUrl.replace(/:\/\/([^:@]+):[^@]+@/, "://$1:****@");
 console.log("[DB] Using:", safeUrl, "ssl=", process.env.DB_SSL);
+const PAUSE_GRACE_MS = Number(process.env.PAUSE_GRACE_MS || 5000); // erst nach 5s Stille wirklich „Pause“
 
 const app = express();
 
@@ -48,6 +49,10 @@ const pool = new Pool({
   connectionString: dbUrl || undefined,
   ssl: useSSL ? { rejectUnauthorized: false } : false,
 });
+
+// wie weit vor Ablauf wir den Access-Token als „abgelaufen“ behandeln (serverseitig)
+const ACCESS_EXP_LEEWAY_MS = Number(process.env.ACCESS_EXP_LEEWAY_MS || 120000); // 2 min
+
 
 /* -------------------- Playback-Event Storage ------------------- */
 async function ensurePlaybackEventsTable() {
@@ -654,7 +659,8 @@ async function getFreshTokenForUser(userId) {
 
   const now = Date.now();
   const exp = u.access_expires_at ? new Date(u.access_expires_at).getTime() : 0;
-  if (u.access_token && exp > now + 30 * 1000) {
+   // 🔁 proaktiv früher refreshen, damit der Wechsel nicht „spürbar“ wird
+  if (u.access_token && exp > now + ACCESS_EXP_LEEWAY_MS) {
     return u.access_token;
   }
   if (!u.refresh_token_enc) throw new Error("no refresh token");
@@ -945,6 +951,7 @@ function startPollingForSender(senderId, senderName) {
     lastIsPlaying: null,
     lastProgress: 0,
     lastKeepalive: 0,
+    noItemSince: 0,        // ms-Timestamp, ab wann wir 204/kein item sehen
   };
 
   console.log(`[POLL] startPollingForSender for ${senderName} (${senderId})`);
@@ -960,8 +967,22 @@ function startPollingForSender(senderId, senderName) {
       if (r.status === 204 || !r.data || !r.data.item) {
         // 204 oder kein item: kann Werbung, private session, inaktives Gerät etc. sein
         const why = r?.data?.currently_playing_type || "no_item";
-        console.log(`[POLL] ${senderId} no item (status=${r.status}) reason=${why}`);
-        if (state.lastTrackId && state.lastIsPlaying === true) {
+        const nowMs = Date.now();
+
+        // 🕐 merken, seit wann kein Item mehr kam
+        if (!state.noItemSince) state.noItemSince = nowMs;
+        const silentFor = nowMs - state.noItemSince;
+
+        console.log(
+          `[POLL] ${senderId} no item (status=${r.status}) reason=${why} silentFor=${silentFor}ms`
+        );
+
+        // Nur wenn wirklich LANGE (PAUSE_GRACE_MS) nichts kommt → einmalig Pause broadcasten
+        if (
+          silentFor >= PAUSE_GRACE_MS &&
+          state.lastTrackId &&
+          state.lastIsPlaying === true
+        ) {
           broadcastJSON({
             type: "track",
             kind: "playstate",
@@ -969,11 +990,16 @@ function startPollingForSender(senderId, senderName) {
             trackId: state.lastTrackId,
             progress_ms: state.lastProgress || 0,
             is_playing: false,
-            ts: Date.now(),
+            ts: nowMs,
           });
           state.lastIsPlaying = false;
+          // kein Reset von noItemSince – wir bleiben in „Pause“, bis wieder ein echtes Item kommt
         }
+
         return;
+      } else {
+        // wir haben wieder ein echtes Item → Stille-Timer zurücksetzen
+        state.noItemSince = 0;
       }
 
       const data = r.data;
