@@ -1465,7 +1465,18 @@ app.get("/events/since", async (req, res) => {
           -- nur seeks mit >=600ms Abstand, alles andere durchlassen
           kind <> 'seek' OR prev_seek_ts IS NULL OR (ts_ms - prev_seek_ts) > 600
       )
-      SELECT id, sender_id, kind, track_id, progress_ms, is_playing, name, artists, image, ts_ms, created_at
+      SELECT 
+        id,
+        sender_id,
+        kind,
+        track_id      AS "trackId",
+        progress_ms,
+        is_playing,
+        name,
+        artists,
+        image,
+        ts_ms,
+        created_at
       FROM thin_seek
       ORDER BY id ASC
       LIMIT $4
