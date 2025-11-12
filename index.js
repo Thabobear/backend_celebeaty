@@ -1581,25 +1581,16 @@ wss.on("connection", (ws) => {
   });
   // 💡 NEU: erkennen, wenn App (WS) geschlossen wurde → Session nach Grace beenden
   ws.on("close", () => {
-    const uid = ws.__userId;
+    const uid = ws.__userId ? String(ws.__userId) : null;
     if (!uid) return;
 
     // Verbindung aus Registry entfernen
     const set = socketsByUser.get(uid);
     if (set) {
       set.delete(ws);
-      if (!set.size) socketsByUser.delete(uid);
-    }
-
-     // 👇 NEU: App/Spotify geschlossen → nach 5s „app_closed“ beenden
-  ws.on("close", () => {
-    const uid = ws.__userId ? String(ws.__userId) : null;
-    if (!uid) return;
-    const set = socketsByUser.get(uid);
-    if (set) {
-      set.delete(ws);
       if (set.size === 0) socketsByUser.delete(uid);
     }
+
     const stillOnline = socketsByUser.get(uid)?.size > 0;
     if (!stillOnline) {
       if (appGoneTimers.has(uid)) { clearTimeout(appGoneTimers.get(uid)); }
