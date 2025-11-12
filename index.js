@@ -1021,32 +1021,21 @@ function startPollingForSender(senderId, senderName) {
         // Harte Kante: sehr lange Pause → Session sauber beenden (einmalig)
         if (silentFor >= PAUSE_TIMEOUT_MS && !state.timedOut) {
           state.timedOut = true;
-          const appOnline =
-            !!(socketsByUser.get(senderId) && socketsByUser.get(senderId).size > 0);
           console.log(
-            `[POLL] ${senderId} Pause >= ${PAUSE_TIMEOUT_MS}ms → stopPolling (${
-              appOnline ? "spotify_closed" : "timeout"
-            })`
+            `[POLL] ${senderId} Pause >= ${PAUSE_TIMEOUT_MS}ms → stopPolling (timeout)`
           );
-          // ✅ Nur wenn die App NICHT online ist → echter Timeout mit Push an Sender
-          if (!appOnline) {
-            try {
-              const tokens = await getPushTokensForUsers([senderId]);
-              if (tokens.length) {
-                await sendExpoPush(
-                  tokens,
-                  "Session beendet",
-                  "Zu lange pausiert – deine Live-Session wurde beendet."
-                );
-              }
-            } catch {}
-          }
-          // Session beenden: spotify_closed (kein Sender-Push) | timeout (mit Sender-Push)
-          await stopPollingForSender(
-            senderId,
-            senderName,
-            appOnline ? "spotify_closed" : "timeout"
-          );
+          // 👉 ECHTER Timeout ⇒ Push an den Sender
+          try {
+            const tokens = await getPushTokensForUsers([senderId]);
+            if (tokens.length) {
+              await sendExpoPush(
+                tokens,
+                "Session beendet",
+                "Zu lange pausiert – deine Live-Session wurde beendet."
+              );
+            }
+          } catch {}
+          await stopPollingForSender(senderId, senderName, "timeout");
         }
         return;
       } else {
