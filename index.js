@@ -1591,26 +1591,29 @@ wss.on("connection", (ws) => {
       if (!set.size) socketsByUser.delete(uid);
     }
 
-    // Wenn kein Socket mehr offen → nach Grace-Timeout Session beenden
-    if (!socketsByUser.has(uid)) {
-      if (appGoneTimers.has(uid)) clearTimeout(appGoneTimers.get(uid));
-      const timer = setTimeout(async () => {
+     // 👇 NEU: App/Spotify geschlossen → nach 5s „app_closed“ beenden
+  ws.on("close", () => {
+    const uid = ws.__userId ? String(ws.__userId) : null;
+    if (!uid) return;
+    const set = socketsByUser.get(uid);
+    if (set) {
+      set.delete(ws);
+      if (set.size === 0) socketsByUser.delete(uid);
+    }
+    const stillOnline = socketsByUser.get(uid)?.size > 0;
+    if (!stillOnline) {
+      if (appGoneTimers.has(uid)) { clearTimeout(appGoneTimers.get(uid)); }
+      const t = setTimeout(async () => {
         appGoneTimers.delete(uid);
-
-        // Nur wenn noch ein Poller läuft (Sender aktiv war)
-        if (!pollers.has(uid)) return;
-        console.log(`[WS] sender app gone → end session (app_closed) uid=${uid}`);
-
-        let senderName = uid;
         try {
-          const q = await pool.query(`SELECT display_name FROM users WHERE id = $1`, [uid]);
-          if (q.rowCount && q.rows[0].display_name) senderName = q.rows[0].display_name;
-        } catch {}
-
-        await stopPollingForSender(uid, senderName, "app_closed");
-      }, APP_GONE_TIMEOUT_MS);
-
-      appGoneTimers.set(uid, timer);
+          const r = await pool.query(`SELECT display_name FROM users WHERE id = $1`, [uid]);
+          const name = r.rows?.[0]?.display_name || uid;
+          await stopPollingForSender(uid, name, "app_closed");
+        } catch (e) {
+          console.warn("[WS] app_closed stopPolling failed:", e?.message || e);
+        }
+      }, 5000); // kleine Gnadenfrist
+      appGoneTimers.set(uid, t);
     }
   });
 });
