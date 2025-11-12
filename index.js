@@ -17,7 +17,8 @@ const rawUrl = process.env.DATABASE_URL || "";
 const safeUrl = rawUrl.replace(/:\/\/([^:@]+):[^@]+@/, "://$1:****@");
 console.log("[DB] Using:", safeUrl, "ssl=", process.env.DB_SSL);
 const PAUSE_GRACE_MS = Number(process.env.PAUSE_GRACE_MS || 5000); // erst nach 5s Stille wirklich „Pause“
-const PAUSE_TIMEOUT_MS = Number(process.env.PAUSE_TIMEOUT_MS || 30000); // 30 s Pause => Session-Ende
+const PAUSE_TIMEOUT_MS = Number(process.env.PAUSE_TIMEOUT_MS || 10000); // 🔧 Test: 10 s Pause => Session-Ende
+const APP_GONE_TIMEOUT_MS = Number(process.env.APP_GONE_TIMEOUT_MS || 10000); // 🔧 App-geschlossen-Kante (Fall 2)
 
 
 const app = express();
@@ -30,6 +31,9 @@ const REPLAY_POLL_MS = Number(process.env.REPLAY_POLL_MS || 600);   // 0.6 s
 const REPLAY_LAG_MS  = Number(process.env.REPLAY_LAG_MS  || 1000);  // 0.8–1.5 s ist sweet spot
 // Registry: pro (senderId:followerId) ein Timer
 const replayers = new Map(); // key: `${senderId}:${followerId}` -> { timer, afterId }
+// WS Präsenz
+const socketsByUser = new Map(); // userId -> Set<WebSocket>
+const appGoneTimers = new Map(); // userId -> Timeout
 
 /* -------------------- Basics -------------------- */
 app.set("trust proxy", 1);
@@ -1032,7 +1036,7 @@ function startPollingForSender(senderId, senderName) {
             }
           } catch {}
           // Session beenden und Grund mitschicken
-          await stopPollingForSender(senderId, senderName, "timeout");
+          await stopPollingForSender(senderId, senderName, "timeout"); // Fall 4
         }
         return;
       } else {
@@ -1550,6 +1554,20 @@ wss.on("connection", (ws) => {
     let data;
     try { data = JSON.parse(raw); } catch { return; }
 
+    // Präsenz-Tracking: Sender meldet sich mit hello
+    if (data?.type === "hello" && data?.userId) {
+     ws.__userId = String(data.userId);
+      if (!socketsByUser.has(ws.__userId)) socketsByUser.set(ws.__userId, new Set());
+      socketsByUser.get(ws.__userId).add(ws);
+      // falls es einen App-Gone-Timer gab → löschen
+      const t = appGoneTimers.get(ws.__userId);
+      if (t) { clearTimeout(t); appGoneTimers.delete(ws.__userId); }
+    }
+
+    // optional: Keepalive vom Client
+    if (data?.type === "app_alive" && data?.userId && ws.__userId === String(data.userId)) {
+      // nichts zu tun – die Existenz der offenen WS-Verbindung reicht als Präsenzsignal
+    }
     wss.clients.forEach((client) => {
       if (client !== ws && client.readyState === WebSocket.OPEN) {
         try { client.send(JSON.stringify(data)); } catch {}
@@ -1559,6 +1577,40 @@ wss.on("connection", (ws) => {
     if (data?.type === "follow" && data.followingUserId) {
       const count = Array.from(wss.clients).filter((c) => c !== ws && c.readyState === WebSocket.OPEN).length;
       try { ws.send(JSON.stringify({ type: "listener_count", count, ts: Date.now() })); } catch {}
+    }
+  });
+  // 💡 NEU: erkennen, wenn App (WS) geschlossen wurde → Session nach Grace beenden
+  ws.on("close", () => {
+    const uid = ws.__userId;
+    if (!uid) return;
+
+    // Verbindung aus Registry entfernen
+    const set = socketsByUser.get(uid);
+    if (set) {
+      set.delete(ws);
+      if (!set.size) socketsByUser.delete(uid);
+    }
+
+    // Wenn kein Socket mehr offen → nach Grace-Timeout Session beenden
+    if (!socketsByUser.has(uid)) {
+      if (appGoneTimers.has(uid)) clearTimeout(appGoneTimers.get(uid));
+      const timer = setTimeout(async () => {
+        appGoneTimers.delete(uid);
+
+        // Nur wenn noch ein Poller läuft (Sender aktiv war)
+        if (!pollers.has(uid)) return;
+        console.log(`[WS] sender app gone → end session (app_closed) uid=${uid}`);
+
+        let senderName = uid;
+        try {
+          const q = await pool.query(`SELECT display_name FROM users WHERE id = $1`, [uid]);
+          if (q.rowCount && q.rows[0].display_name) senderName = q.rows[0].display_name;
+        } catch {}
+
+        await stopPollingForSender(uid, senderName, "app_closed");
+      }, APP_GONE_TIMEOUT_MS);
+
+      appGoneTimers.set(uid, timer);
     }
   });
 });
