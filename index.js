@@ -16,9 +16,9 @@ require("dotenv").config();
 const rawUrl = process.env.DATABASE_URL || "";
 const safeUrl = rawUrl.replace(/:\/\/([^:@]+):[^@]+@/, "://$1:****@");
 console.log("[DB] Using:", safeUrl, "ssl=", process.env.DB_SSL);
-const PAUSE_GRACE_MS = Number(process.env.PAUSE_GRACE_MS || 5000); // erst nach 5s Stille wirklich „Pause“
-const PAUSE_TIMEOUT_MS = Number(process.env.PAUSE_TIMEOUT_MS || 10000); // 🔧 Test: 10 s Pause => Session-Ende
-const APP_GONE_TIMEOUT_MS = Number(process.env.APP_GONE_TIMEOUT_MS || 10000); // 🔧 App-geschlossen-Kante (Fall 2)
+const PAUSE_GRACE_MS = Number(process.env.PAUSE_GRACE_MS || 0); 
+const PAUSE_TIMEOUT_MS = Number(process.env.PAUSE_TIMEOUT_MS || 0); 
+const APP_GONE_TIMEOUT_MS = Number(process.env.APP_GONE_TIMEOUT_MS || 0); 
 
 
 const app = express();
@@ -1028,11 +1028,11 @@ function startPollingForSender(senderId, senderName) {
           try {
             const tokens = await getPushTokensForUsers([senderId]);
             if (tokens.length) {
-              await sendExpoPush(
-                tokens,
-                "Session beendet",
-                "Zu lange pausiert – deine Live-Session wurde beendet."
-              );
+            await sendExpoPush(
+              tokens,
+              "Session beendet",
+              "Spotify angehalten - deine Session wurde beendet"
+            );
             }
           } catch {}
           await stopPollingForSender(senderId, senderName, "timeout");
@@ -1602,7 +1602,7 @@ wss.on("connection", (ws) => {
         } catch (e) {
           console.warn("[WS] app_closed stopPolling failed:", e?.message || e);
         }
-      }, 5000); // kleine Gnadenfrist
+      }, 0); // keine Gnadenfrist mehr – sofortiges Session-Ende bei App-Schließen
       appGoneTimers.set(uid, t);
     }
   });
