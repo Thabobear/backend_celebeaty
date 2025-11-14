@@ -16,6 +16,10 @@ require("dotenv").config();
 const rawUrl = process.env.DATABASE_URL || "";
 const safeUrl = rawUrl.replace(/:\/\/([^:@]+):[^@]+@/, "://$1:****@");
 console.log("[DB] Using:", safeUrl, "ssl=", process.env.DB_SSL);
+const PAUSE_GRACE_MS = Number(process.env.PAUSE_GRACE_MS || 5000); // erst nach 5s Stille wirklich „Pause“
+const PAUSE_TIMEOUT_MS = Number(process.env.PAUSE_TIMEOUT_MS || 10000); // 🔧 Test: 10 s Pause => Session-Ende
+const APP_GONE_TIMEOUT_MS = Number(process.env.APP_GONE_TIMEOUT_MS || 10000); // 🔧 App-geschlossen-Kante (Fall 2)
+
 
 const app = express();
 
@@ -140,13 +144,7 @@ async function getPushTokensForUsers(userIds = []) {
     `SELECT expo_token FROM push_tokens WHERE user_id = ANY($1)`,
     [userIds]
   );
-  const tokens = rows.map(r => r.expo_token).filter(Boolean);
-  if (!tokens.length) {
-    console.log("[PUSH] no expo tokens for users", userIds);
-  } else {
-    console.log("[PUSH] loaded", tokens.length, "expo tokens for users", userIds);
-  }
-  return tokens;
+  return rows.map(r => r.expo_token).filter(Boolean);
 }
 async function sendExpoPush(expoTokens, title, body) {
   if (!expoTokens.length) return;
@@ -303,23 +301,19 @@ app.post("/push/register", async (req, res) => {
     const me = await spotifyGet("https://api.spotify.com/v1/me", t.accessToken);
     if (me.status !== 200) return res.status(401).json({ error: "me_failed" });
     const userId = me.data.id;
-    console.log("[PUSH][REGISTER] incoming register for user:", userId, "body:", req.body);
     // akzeptiere { expo_token } ODER { token } aus dem Frontend
     const expoToken =
       (req.body && (req.body.expo_token || req.body.token))
         ? String(req.body.expo_token || req.body.token)
         : "";
     if (!expoToken) {
-      console.log("[PUSH][REGISTER] missing_expo_token for", userId);
       return res.status(400).json({ error: "missing_expo_token" });
     }
     // einfache Plausibilitätsprüfung
     if (!/^ExponentPushToken\[\S+\]$/.test(expoToken)) {
-      console.log("[PUSH][REGISTER] invalid_token_format for", userId, "token:", expoToken);
       return res.status(400).json({ error: "invalid_token_format" });
     }
     await upsertPushToken(userId, expoToken);
-    console.log("[PUSH][REGISTER] stored token for", userId);
     res.json({ ok: true });
   } catch (e) {
     console.error("push/register error:", e.message);
@@ -743,8 +737,6 @@ async function alignFollowerPlayback(followerId, { trackId, progress, shouldPlay
   }
 }
 
-
-
 /** DB-Event-Replayer: folgt den gespeicherten Events des Senders für genau einen Follower */
 function startDbReplayer(senderId, followerId) {
   const key = `${senderId}:${followerId}`;
@@ -851,16 +843,6 @@ function stopAllReplayersForSender(senderId) {
     replayers.delete(k);
   }
 }
-
-// Legacy-No-Ops: Keep-Alive für kurze Pausen wurde entfernt, um die Logik zu vereinfachen
-function startGraceKeepAliveForFollowers(_senderId) {
-  return;
-}
-
-function stopGraceKeepAliveForFollowers(_senderId) {
-  return;
-}
-
 
 /** Follower eines Senders synchronisieren (nur auf „relevante“ Events reagieren) */
 async function fanoutToFollowers(senderId, payload) {
@@ -970,13 +952,14 @@ function broadcastPlaystateFalse({ senderId, senderName, trackId, progressMs }) 
 
 function startPollingForSender(senderId, senderName) {
   if (pollers.has(senderId)) return;
+
   const state = {
     lastTrackId: null,
     lastIsPlaying: null,
     lastProgress: 0,
     lastKeepalive: 0,
+    noItemSince: 0,        // ms-Timestamp, ab wann wir 204/kein item sehen
   };
-  
 
   console.log(`[POLL] startPollingForSender for ${senderName} (${senderId})`);
 
@@ -991,12 +974,75 @@ function startPollingForSender(senderId, senderName) {
       if (r.status === 204 || !r.data || !r.data.item) {
         // 204 oder kein item: kann Werbung, private session, inaktives Gerät etc. sein
         const why = r?.data?.currently_playing_type || "no_item";
+        const nowMs = Date.now();
+
+        // 🕐 merken, seit wann kein Item mehr kam
+        if (!state.noItemSince) state.noItemSince = nowMs;
+        const silentFor = nowMs - state.noItemSince;
+
         console.log(
-          `[POLL] ${senderId} no item (status=${r.status}) reason=${why}`
+          `[POLL] ${senderId} no item (status=${r.status}) reason=${why} silentFor=${silentFor}ms`
         );
-        // Kein Synthese-Pause-Event mehr, kein Timeout – Session läuft, bis explizit gestoppt wird
+
+        // Nur wenn wirklich LANGE (PAUSE_GRACE_MS) nichts kommt → einmalig Pause broadcasten & persistieren
+        if (
+          silentFor >= PAUSE_GRACE_MS &&
+          state.lastTrackId &&
+          state.lastIsPlaying === true
+        ) {
+          broadcastJSON({
+            type: "track",
+            kind: "playstate",
+            user: { id: senderId, name: senderName || senderId },
+            trackId: state.lastTrackId,
+            progress_ms: state.lastProgress || 0,
+            is_playing: false,
+            ts: nowMs,
+          });
+          try {
+            await storePlaybackEvent({
+              sender_id: senderId,
+              kind: "playstate",
+              track_id: state.lastTrackId,
+              progress_ms: state.lastProgress || 0,
+              is_playing: false,
+              name: null,
+              artists: [],
+              image: null,
+              ts_ms: nowMs,
+            });
+            console.log(`[EVT][STORE] playstate ${senderId} is_playing=false @${state.lastProgress || 0}`);
+          } catch {}
+          state.lastIsPlaying = false;
+          state.wasSilentlyPaused = true; // merken: Pause kam aus „Silence“
+          // kein Reset von noItemSince – wir bleiben in „Pause“, bis wieder ein echtes Item kommt
+        }
+
+        // Harte Kante: sehr lange Pause → Session sauber beenden (einmalig)
+        if (silentFor >= PAUSE_TIMEOUT_MS && !state.timedOut) {
+          state.timedOut = true;
+          console.log(
+            `[POLL] ${senderId} Pause >= ${PAUSE_TIMEOUT_MS}ms → stopPolling (timeout)`
+          );
+          // 👉 ECHTER Timeout ⇒ Push an den Sender
+          try {
+            const tokens = await getPushTokensForUsers([senderId]);
+            if (tokens.length) {
+              await sendExpoPush(
+                tokens,
+                "Session beendet",
+                "Zu lange pausiert – deine Live-Session wurde beendet."
+              );
+            }
+          } catch {}
+          await stopPollingForSender(senderId, senderName, "timeout");
+        }
         return;
-      } 
+      } else {
+        // wir haben wieder ein echtes Item → Stille-Timer zurücksetzen
+        state.noItemSince = 0;
+        state.timedOut = false; // Reset, weil wieder ein echtes Item da ist
+      }
 
       const data = r.data;
       const item = data.item;
@@ -1042,15 +1088,8 @@ function startPollingForSender(senderId, senderName) {
         if (SERVER_FANOUT) fanoutToFollowers(senderId, msg);
         // persistieren (nur „relevante“ Events)
         await storePlaybackEvent({
-          sender_id: senderId,
-          kind: "trackchange",
-          track_id: trackId,
-          progress_ms: progress,
-          is_playing,
-          name: msg.name,
-          artists: msg.artists,
-          image: msg.image,
-          ts_ms: now
+          sender_id: senderId, kind: "trackchange", track_id: trackId,
+          progress_ms: progress, is_playing, name: msg.name, artists: msg.artists, image: msg.image, ts_ms: now
         });
         console.log(`[EVT][STORE] trackchange ${senderId} ${trackId} @${progress}`);
       } else if (playStateChanged) {
@@ -1071,42 +1110,13 @@ function startPollingForSender(senderId, senderName) {
         if (SERVER_FANOUT) fanoutToFollowers(senderId, msg);
         // persistieren (nur „relevante“ Events)
         await storePlaybackEvent({
-          sender_id: senderId,
-          kind: "playstate",
-          track_id: trackId,
-          progress_ms: progress,
-          is_playing,
-          name: msg.name,
-          artists: msg.artists,
-          image: msg.image,
-          ts_ms: now,
+          sender_id: senderId, kind: "playstate", track_id: trackId,
+          progress_ms: progress, is_playing, name: msg.name, artists: msg.artists, image: msg.image, ts_ms: now
         });
         console.log(`[EVT][STORE] playstate ${senderId} is_playing=${is_playing} @${progress}`);
-
-        // 🔴 Sobald der Sender pausiert, Session sofort beenden + Push an den Sender
-        if (!is_playing) {
-          try {
-            const tokens = await getPushTokensForUsers([senderId]);
-            if (!tokens.length) {
-              console.log("[PUSH] pause-end: no push token registered for sender", senderId);
-            } else {
-              await sendExpoPush(
-                tokens,
-                "Session beendet",
-                "Du hast pausiert – deine Live-Session wurde beendet."
-              );
-              console.log("[PUSH] pause-end: push sent to sender", senderId);
-            }
-          } catch (e) {
-            console.warn("[PUSH] pause-end for sender failed:", e?.message || e);
-          }
-
-          await stopPollingForSender(senderId, senderName, "paused_by_user");
-          return; // WICHTIG: diesen Poll-Durchlauf hier abbrechen
-        }
       } else if (seekDetected || needKeepalive) {
-       const msg = {
-         type: "track",
+        const msg = {
+          type: "track",
           kind: seekDetected ? "seek" : "keepalive",
           user: { id: senderId, name: senderName || senderId },
           trackId,
@@ -1133,6 +1143,38 @@ function startPollingForSender(senderId, senderName) {
       state.lastTrackId = trackId;
       state.lastIsPlaying = is_playing;
       state.lastProgress = progress;
+
+ // 🩵 FIX: Wenn Spotify nach längerer Pause "aufwacht" → fehlendes Play-Event nachreichen
+     if (!state.hasAnnouncedResume && is_playing && !trackChanged) {
+       const since = Date.now() - (state.lastKeepalive || 0);
+       if (since > 10000) {
+         console.log(`[Celebeaty] Detected resume after long pause → broadcast playstate:true for ${senderName}`);
+         const msg = {
+           type: "track",
+           kind: "playstate",
+           user: { id: senderId, name: senderName || senderId },
+           trackId,
+           progress_ms: progress,
+           name: item.name,
+           artists: (item.artists || []).map(a => a.name),
+           image: item.album?.images?.[0]?.url || null,
+           is_playing: true,
+           ts: Date.now(),
+         };
+         broadcastJSON(msg);
+         if (SERVER_FANOUT) fanoutToFollowers(senderId, msg);
+         // ❗ WICHTIG: auch in DB persistieren, damit /events/since dieses Playstate bekommt
+         await storePlaybackEvent({
+           sender_id: senderId, kind: "playstate", track_id: trackId,
+           progress_ms: progress, is_playing: true,
+           name: msg.name, artists: msg.artists, image: msg.image, ts_ms: msg.ts
+         });
+         state.hasAnnouncedResume = true;
+       }
+     } else if (!is_playing) {
+       state.hasAnnouncedResume = false; // reset, damit nächster Resume erkannt wird
+     }
+
     } catch (e) {
       console.warn(`[POLL][ERR] ${senderId} ${e?.message || e}`);
     }
@@ -1143,8 +1185,6 @@ function startPollingForSender(senderId, senderName) {
 
 async function stopPollingForSender(senderId, senderName, reason = null) {
   const p = pollers.get(senderId);
-  // Aufräumen: evtl. aktive Grace-Pinger stoppen
-  stopGraceKeepAliveForFollowers(senderId);
   if (p) {
     // vor dem Stoppen ein letztes „Pause“-Signal senden (falls wir noch State haben)
     const lastTrackId = p.state?.lastTrackId || null;
