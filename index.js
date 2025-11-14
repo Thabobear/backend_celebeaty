@@ -36,6 +36,14 @@ const replayers = new Map(); // key: `${senderId}:${followerId}` -> { timer, aft
 const socketsByUser = new Map(); // userId -> Set<WebSocket>
 const appGoneTimers = new Map(); // userId -> Timeout
 
+
+// === Receiver-Device Keep-Alive während kurzer Pausen ===
+const KEEPALIVE_DUR_MS = Number(process.env.KEEPALIVE_DUR_MS || 10000);   // 10s „warm halten“
+const KEEPALIVE_INTERVAL_MS = Number(process.env.KEEPALIVE_INTERVAL_MS || 3000); // alle 3s „anstupsen“
+// followerId -> { timer }
+const gracePingers = new Map();
+
+
 /* -------------------- Basics -------------------- */
 app.set("trust proxy", 1);
 app.use(express.json());
@@ -738,6 +746,8 @@ async function alignFollowerPlayback(followerId, { trackId, progress, shouldPlay
   }
 }
 
+
+
 /** DB-Event-Replayer: folgt den gespeicherten Events des Senders für genau einen Follower */
 function startDbReplayer(senderId, followerId) {
   const key = `${senderId}:${followerId}`;
@@ -844,6 +854,58 @@ function stopAllReplayersForSender(senderId) {
     replayers.delete(k);
   }
 }
+
+/** Receiver-Device für eine kurze Zeit „wach halten“, ohne zu spielen */
+function startGraceKeepAliveForFollowers(senderId) {
+  const set = followersBySender.get(senderId);
+  if (!set || !set.size) return;
+  const until = Date.now() + KEEPALIVE_DUR_MS;
+
+  for (const followerId of set) {
+    if (gracePingers.has(followerId)) continue; // schon aktiv
+    const state = { until };
+
+    const timer = setInterval(async () => {
+      try {
+        if (Date.now() > state.until) {
+          clearInterval(timer);
+          gracePingers.delete(followerId);
+          return;
+        }
+        // Device wählen (wie in alignFollowerPlayback)
+        const devRes = await spGetForUser(followerId, "https://api.spotify.com/v1/me/player/devices");
+        const devices = (devRes.status === 200 && devRes.data && devRes.data.devices) ? devRes.data.devices : [];
+        if (!devices.length) return;
+        const device =
+          devices.find(d => /iPhone|iOS|Smartphone/i.test(d?.name) || d?.type === "Smartphone") ||
+          devices.find(d => d?.is_active) ||
+          devices.find(d => !d?.is_restricted) ||
+          devices[0];
+        if (!device) return;
+        // 🚫 Kein Ton: transfer auf dasselbe Device mit play:false
+        await spPutForUser(followerId, "https://api.spotify.com/v1/me/player", {
+          device_ids: [device.id],
+          play: false,
+        });
+      } catch { /* still & silent */ }
+    }, KEEPALIVE_INTERVAL_MS);
+
+    gracePingers.set(followerId, { timer });
+  }
+}
+
+function stopGraceKeepAliveForFollowers(senderId) {
+  const set = followersBySender.get(senderId);
+  if (!set || !set.size) return;
+  for (const followerId of set) {
+    const p = gracePingers.get(followerId);
+    if (p) {
+      try { clearInterval(p.timer); } catch {}
+      gracePingers.delete(followerId);
+    }
+  }
+}
+
 
 /** Follower eines Senders synchronisieren (nur auf „relevante“ Events reagieren) */
 async function fanoutToFollowers(senderId, payload) {
@@ -1021,6 +1083,8 @@ function startPollingForSender(senderId, senderName) {
           state.wasSilentlyPaused = true; // merken: Pause kam aus „Silence“
           state.hasAnnouncedResume = false;
           // kein Reset von noItemSince – wir bleiben in „Pause“, bis wieder ein echtes Item kommt
+          // ➕ Receiver-Devices 10s „wach halten“, obwohl pausiert
+          startGraceKeepAliveForFollowers(senderId);
         }
 
         // Harte Kante: sehr lange Pause → Session sauber beenden (einmalig)
@@ -1174,6 +1238,8 @@ function startPollingForSender(senderId, senderName) {
         });
         state.wasSilentlyPaused = false;
         state.hasAnnouncedResume = true;
+        // Receiver müssen nicht länger wachgehalten werden
+        stopGraceKeepAliveForFollowers(senderId);
       }
       if (!is_playing) {
         state.hasAnnouncedResume = false; // defensiv reset
@@ -1188,6 +1254,8 @@ function startPollingForSender(senderId, senderName) {
 
 async function stopPollingForSender(senderId, senderName, reason = null) {
   const p = pollers.get(senderId);
+  // Aufräumen: evtl. aktive Grace-Pinger stoppen
+  stopGraceKeepAliveForFollowers(senderId);
   if (p) {
     // vor dem Stoppen ein letztes „Pause“-Signal senden (falls wir noch State haben)
     const lastTrackId = p.state?.lastTrackId || null;
