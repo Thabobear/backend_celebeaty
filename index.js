@@ -303,19 +303,23 @@ app.post("/push/register", async (req, res) => {
     const me = await spotifyGet("https://api.spotify.com/v1/me", t.accessToken);
     if (me.status !== 200) return res.status(401).json({ error: "me_failed" });
     const userId = me.data.id;
+    console.log("[PUSH][REGISTER] incoming register for user:", userId, "body:", req.body);
     // akzeptiere { expo_token } ODER { token } aus dem Frontend
     const expoToken =
       (req.body && (req.body.expo_token || req.body.token))
         ? String(req.body.expo_token || req.body.token)
         : "";
     if (!expoToken) {
+      console.log("[PUSH][REGISTER] missing_expo_token for", userId);
       return res.status(400).json({ error: "missing_expo_token" });
     }
     // einfache Plausibilitätsprüfung
     if (!/^ExponentPushToken\[\S+\]$/.test(expoToken)) {
+      console.log("[PUSH][REGISTER] invalid_token_format for", userId, "token:", expoToken);
       return res.status(400).json({ error: "invalid_token_format" });
     }
     await upsertPushToken(userId, expoToken);
+    console.log("[PUSH][REGISTER] stored token for", userId);
     res.json({ ok: true });
   } catch (e) {
     console.error("push/register error:", e.message);
