@@ -1192,13 +1192,39 @@ function startPollingForSender(senderId, senderName) {
         if (SERVER_FANOUT) fanoutToFollowers(senderId, msg);
         // persistieren (nur „relevante“ Events)
         await storePlaybackEvent({
-          sender_id: senderId, kind: "playstate", track_id: trackId,
-          progress_ms: progress, is_playing, name: msg.name, artists: msg.artists, image: msg.image, ts_ms: now
+          sender_id: senderId,
+          kind: "playstate",
+          track_id: trackId,
+          progress_ms: progress,
+          is_playing,
+          name: msg.name,
+          artists: msg.artists,
+          image: msg.image,
+          ts_ms: now,
         });
         console.log(`[EVT][STORE] playstate ${senderId} is_playing=${is_playing} @${progress}`);
+
+        // 🔴 NEU: Sobald der Sender pausiert, Session sofort beenden + Push an den Sender
+        if (!is_playing) {
+          try {
+            const tokens = await getPushTokensForUsers([senderId]);
+            if (tokens.length) {
+              await sendExpoPush(
+                tokens,
+                "Session beendet",
+                "Du hast pausiert – deine Live-Session wurde beendet."
+              );
+            }
+          } catch (e) {
+            console.warn("[PUSH] pause-end for sender failed:", e?.message || e);
+          }
+
+          await stopPollingForSender(senderId, senderName, "paused_by_user");
+          return; // WICHTIG: diesen Poll-Durchlauf hier abbrechen
+        }
       } else if (seekDetected || needKeepalive) {
-        const msg = {
-          type: "track",
+       const msg = {
+         type: "track",
           kind: seekDetected ? "seek" : "keepalive",
           user: { id: senderId, name: senderName || senderId },
           trackId,
