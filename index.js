@@ -1159,14 +1159,20 @@ function startPollingForSender(senderId, senderName) {
         if (SERVER_FANOUT) fanoutToFollowers(senderId, msg);
         // persistieren (nur „relevante“ Events)
         await storePlaybackEvent({
-
+          sender_id: senderId,
+          kind: "trackchange",
+          track_id: trackId,
+          progress_ms: progress,
+          is_playing,
+          name: msg.name,
+          artists: msg.artists,
+          image: msg.image,
+          ts_ms: now
+        });
         // ⏱️ NEU: bei jeder erkannten Pause sofort Geräte der Follower „wach halten“
         if (!is_playing) {
           startGraceKeepAliveForFollowers(senderId);
         }
-          sender_id: senderId, kind: "trackchange", track_id: trackId,
-          progress_ms: progress, is_playing, name: msg.name, artists: msg.artists, image: msg.image, ts_ms: now
-        });
         console.log(`[EVT][STORE] trackchange ${senderId} ${trackId} @${progress}`);
       } else if (playStateChanged) {
         const msg = {
