@@ -16,11 +16,6 @@ require("dotenv").config();
 const rawUrl = process.env.DATABASE_URL || "";
 const safeUrl = rawUrl.replace(/:\/\/([^:@]+):[^@]+@/, "://$1:****@");
 console.log("[DB] Using:", safeUrl, "ssl=", process.env.DB_SSL);
-// Sofortiges Pausieren (kurze Gnadenfrist), aber Session erst nach 10s beenden
-const PAUSE_GRACE_MS = Number(process.env.PAUSE_GRACE_MS || 500);   // ~0.5s bis wir playstate:false senden
-const PAUSE_TIMEOUT_MS = Number(process.env.PAUSE_TIMEOUT_MS || 10000); // 10s Stille → Session-Ende (timeout)
-const APP_GONE_TIMEOUT_MS = Number(process.env.APP_GONE_TIMEOUT_MS || 10000); // 🔧 App-geschlossen-Kante (Fall 2)
-
 
 const app = express();
 
@@ -35,14 +30,6 @@ const replayers = new Map(); // key: `${senderId}:${followerId}` -> { timer, aft
 // WS Präsenz
 const socketsByUser = new Map(); // userId -> Set<WebSocket>
 const appGoneTimers = new Map(); // userId -> Timeout
-
-
-// === Receiver-Device Keep-Alive während kurzer Pausen ===
-const KEEPALIVE_DUR_MS = Number(process.env.KEEPALIVE_DUR_MS || 10000);   // 10s „warm halten“
-const KEEPALIVE_INTERVAL_MS = Number(process.env.KEEPALIVE_INTERVAL_MS || 3000); // alle 3s „anstupsen“
-// followerId -> { timer }
-const gracePingers = new Map();
-
 
 /* -------------------- Basics -------------------- */
 app.set("trust proxy", 1);
@@ -855,57 +842,13 @@ function stopAllReplayersForSender(senderId) {
   }
 }
 
-/** Receiver-Device für eine kurze Zeit „wach halten“, ohne zu spielen */
-function startGraceKeepAliveForFollowers(senderId) {
-  const set = followersBySender.get(senderId);
-  if (!set || !set.size) return;
-  const until = Date.now() + KEEPALIVE_DUR_MS;
-
-  for (const followerId of set) {
-    if (gracePingers.has(followerId)) continue; // schon aktiv
-    const state = { until };
-
-    const timer = setInterval(async () => {
-      try {
-        if (Date.now() > state.until) {
-          clearInterval(timer);
-          gracePingers.delete(followerId);
-          return;
-        }
-        // Device wählen (wie in alignFollowerPlayback)
-        const devRes = await spGetForUser(followerId, "https://api.spotify.com/v1/me/player/devices");
-        const devices = (devRes.status === 200 && devRes.data && devRes.data.devices) ? devRes.data.devices : [];
-        if (!devices.length) return;
-        const device =
-          devices.find(d => /iPhone|iOS|Smartphone/i.test(d?.name) || d?.type === "Smartphone") ||
-          devices.find(d => d?.is_active) ||
-          devices.find(d => !d?.is_restricted) ||
-          devices[0];
-        if (!device) return;
-        // 🚫 Kein Ton: 1) Self-Transfer play:false (zählt oft als Aktivität)
-        await spPutForUser(followerId, "https://api.spotify.com/v1/me/player", {
-          device_ids: [device.id],
-          play: false,
-        });
-        // 🙈 Falls Self-Transfer ignoriert wird: 2) explizit nochmal „pause“ (No-Op, aber Aktivität)
-        await spPutForUser(followerId, "https://api.spotify.com/v1/me/player/pause", {});
-      } catch { /* still & silent */ }
-    }, KEEPALIVE_INTERVAL_MS);
-
-    gracePingers.set(followerId, { timer });
-  }
+// Legacy-No-Ops: Keep-Alive für kurze Pausen wurde entfernt, um die Logik zu vereinfachen
+function startGraceKeepAliveForFollowers(_senderId) {
+  return;
 }
 
-function stopGraceKeepAliveForFollowers(senderId) {
-  const set = followersBySender.get(senderId);
-  if (!set || !set.size) return;
-  for (const followerId of set) {
-    const p = gracePingers.get(followerId);
-    if (p) {
-      try { clearInterval(p.timer); } catch {}
-      gracePingers.delete(followerId);
-    }
-  }
+function stopGraceKeepAliveForFollowers(_senderId) {
+  return;
 }
 
 
@@ -1017,17 +960,13 @@ function broadcastPlaystateFalse({ senderId, senderName, trackId, progressMs }) 
 
 function startPollingForSender(senderId, senderName) {
   if (pollers.has(senderId)) return;
-
   const state = {
     lastTrackId: null,
     lastIsPlaying: null,
     lastProgress: 0,
     lastKeepalive: 0,
-    noItemSince: 0,        // ms-Timestamp, ab wann wir 204/kein item sehen
-    wasSilentlyPaused: false, // wurde zuletzt ein playstate:false wegen Stille gesendet?
-    timedOut: false,          // wurde bereits wegen Timeout beendet?
-    hasAnnouncedResume: false // (nur falls irgendwo noch referenziert)
   };
+  
 
   console.log(`[POLL] startPollingForSender for ${senderName} (${senderId})`);
 
@@ -1042,78 +981,12 @@ function startPollingForSender(senderId, senderName) {
       if (r.status === 204 || !r.data || !r.data.item) {
         // 204 oder kein item: kann Werbung, private session, inaktives Gerät etc. sein
         const why = r?.data?.currently_playing_type || "no_item";
-        const nowMs = Date.now();
-
-        // 🕐 merken, seit wann kein Item mehr kam
-        if (!state.noItemSince) state.noItemSince = nowMs;
-        const silentFor = nowMs - state.noItemSince;
-
         console.log(
-          `[POLL] ${senderId} no item (status=${r.status}) reason=${why} silentFor=${silentFor}ms`
+          `[POLL] ${senderId} no item (status=${r.status}) reason=${why}`
         );
-
-        // Nur wenn wirklich LANGE (PAUSE_GRACE_MS) nichts kommt → einmalig Pause broadcasten & persistieren
-        if (
-          silentFor >= PAUSE_GRACE_MS &&
-          state.lastTrackId &&
-          state.lastIsPlaying === true
-        ) {
-          broadcastJSON({
-            type: "track",
-            kind: "playstate",
-            user: { id: senderId, name: senderName || senderId },
-            trackId: state.lastTrackId,
-            progress_ms: state.lastProgress || 0,
-            is_playing: false,
-            ts: nowMs,
-          });
-          try {
-            await storePlaybackEvent({
-              sender_id: senderId,
-              kind: "playstate",
-              track_id: state.lastTrackId,
-              progress_ms: state.lastProgress || 0,
-              is_playing: false,
-              name: null,
-              artists: [],
-              image: null,
-              ts_ms: nowMs,
-            });
-            console.log(`[EVT][STORE] playstate ${senderId} is_playing=false @${state.lastProgress || 0}`);
-          } catch {}
-          state.lastIsPlaying = false;
-          state.wasSilentlyPaused = true; // merken: Pause kam aus „Silence“
-          state.hasAnnouncedResume = false;
-          // kein Reset von noItemSince – wir bleiben in „Pause“, bis wieder ein echtes Item kommt
-          // ➕ Receiver-Devices 10s „wach halten“, obwohl pausiert
-          startGraceKeepAliveForFollowers(senderId);
-        }
-
-        // Harte Kante: sehr lange Pause → Session sauber beenden (einmalig)
-        if (silentFor >= PAUSE_TIMEOUT_MS && !state.timedOut) {
-          state.timedOut = true;
-          console.log(
-            `[POLL] ${senderId} Pause >= ${PAUSE_TIMEOUT_MS}ms → stopPolling (timeout)`
-          );
-          // 👉 ECHTER Timeout ⇒ Push an den Sender
-          try {
-            const tokens = await getPushTokensForUsers([senderId]);
-            if (tokens.length) {
-              await sendExpoPush(
-                tokens,
-                "Session beendet",
-                "Zu lange pausiert – deine Live-Session wurde beendet."
-              );
-            }
-          } catch {}
-          await stopPollingForSender(senderId, senderName, "timeout");
-        }
+        // Kein Synthese-Pause-Event mehr, kein Timeout – Session läuft, bis explizit gestoppt wird
         return;
-      } else {
-        // wir haben wieder ein echtes Item → Stille-Timer zurücksetzen
-        state.noItemSince = 0;
-        state.timedOut = false; // Reset, weil wieder ein echtes Item da ist
-      }
+      } 
 
       const data = r.data;
       const item = data.item;
@@ -1169,10 +1042,6 @@ function startPollingForSender(senderId, senderName) {
           image: msg.image,
           ts_ms: now
         });
-        // ⏱️ NEU: bei jeder erkannten Pause sofort Geräte der Follower „wach halten“
-        if (!is_playing) {
-          startGraceKeepAliveForFollowers(senderId);
-        }
         console.log(`[EVT][STORE] trackchange ${senderId} ${trackId} @${progress}`);
       } else if (playStateChanged) {
         const msg = {
@@ -1251,38 +1120,6 @@ function startPollingForSender(senderId, senderName) {
       state.lastTrackId = trackId;
       state.lastIsPlaying = is_playing;
       state.lastProgress = progress;
-
-      // 🩵 Sofortiges Resume nach kurzer Pause:
-      // Wenn die Pause aus „Stille“ kam (playstate:false wurde gesendet) und der Sender wieder spielt,
-      // feuern wir sofort ein playstate:true + persistieren es → Receiver starten automatisch weiter.
-      if (state.wasSilentlyPaused && is_playing) {
-        const msg = {
-          type: "track",
-          kind: "playstate",
-          user: { id: senderId, name: senderName || senderId },
-          trackId,
-          progress_ms: progress,
-          name: item.name,
-          artists: (item.artists || []).map(a => a.name),
-          image: item.album?.images?.[0]?.url || null,
-          is_playing: true,
-          ts: Date.now(),
-        };
-        broadcastJSON(msg);
-        if (SERVER_FANOUT) fanoutToFollowers(senderId, msg);
-        await storePlaybackEvent({
-          sender_id: senderId, kind: "playstate", track_id: trackId,
-          progress_ms: progress, is_playing: true,
-          name: msg.name, artists: msg.artists, image: msg.image, ts_ms: msg.ts
-        });
-        state.wasSilentlyPaused = false;
-        state.hasAnnouncedResume = true;
-        // Receiver müssen nicht länger wachgehalten werden
-        stopGraceKeepAliveForFollowers(senderId);
-      }
-      if (!is_playing) {
-        state.hasAnnouncedResume = false; // defensiv reset
-      }
     } catch (e) {
       console.warn(`[POLL][ERR] ${senderId} ${e?.message || e}`);
     }
