@@ -16,8 +16,9 @@ require("dotenv").config();
 const rawUrl = process.env.DATABASE_URL || "";
 const safeUrl = rawUrl.replace(/:\/\/([^:@]+):[^@]+@/, "://$1:****@");
 console.log("[DB] Using:", safeUrl, "ssl=", process.env.DB_SSL);
-const PAUSE_GRACE_MS = Number(process.env.PAUSE_GRACE_MS || 5000); // erst nach 5s Stille wirklich „Pause“
-const PAUSE_TIMEOUT_MS = Number(process.env.PAUSE_TIMEOUT_MS || 10000); // 🔧 Test: 10 s Pause => Session-Ende
+// Sofortiges Pausieren (kurze Gnadenfrist), aber Session erst nach 10s beenden
+const PAUSE_GRACE_MS = Number(process.env.PAUSE_GRACE_MS || 500);   // ~0.5s bis wir playstate:false senden
+const PAUSE_TIMEOUT_MS = Number(process.env.PAUSE_TIMEOUT_MS || 10000); // 10s Stille → Session-Ende (timeout)
 const APP_GONE_TIMEOUT_MS = Number(process.env.APP_GONE_TIMEOUT_MS || 10000); // 🔧 App-geschlossen-Kante (Fall 2)
 
 
@@ -959,6 +960,9 @@ function startPollingForSender(senderId, senderName) {
     lastProgress: 0,
     lastKeepalive: 0,
     noItemSince: 0,        // ms-Timestamp, ab wann wir 204/kein item sehen
+    wasSilentlyPaused: false, // wurde zuletzt ein playstate:false wegen Stille gesendet?
+    timedOut: false,          // wurde bereits wegen Timeout beendet?
+    hasAnnouncedResume: false // (nur falls irgendwo noch referenziert)
   };
 
   console.log(`[POLL] startPollingForSender for ${senderName} (${senderId})`);
@@ -1015,6 +1019,7 @@ function startPollingForSender(senderId, senderName) {
           } catch {}
           state.lastIsPlaying = false;
           state.wasSilentlyPaused = true; // merken: Pause kam aus „Silence“
+          state.hasAnnouncedResume = false;
           // kein Reset von noItemSince – wir bleiben in „Pause“, bis wieder ein echtes Item kommt
         }
 
@@ -1144,37 +1149,35 @@ function startPollingForSender(senderId, senderName) {
       state.lastIsPlaying = is_playing;
       state.lastProgress = progress;
 
- // 🩵 FIX: Wenn Spotify nach längerer Pause "aufwacht" → fehlendes Play-Event nachreichen
-     if (!state.hasAnnouncedResume && is_playing && !trackChanged) {
-       const since = Date.now() - (state.lastKeepalive || 0);
-       if (since > 10000) {
-         console.log(`[Celebeaty] Detected resume after long pause → broadcast playstate:true for ${senderName}`);
-         const msg = {
-           type: "track",
-           kind: "playstate",
-           user: { id: senderId, name: senderName || senderId },
-           trackId,
-           progress_ms: progress,
-           name: item.name,
-           artists: (item.artists || []).map(a => a.name),
-           image: item.album?.images?.[0]?.url || null,
-           is_playing: true,
-           ts: Date.now(),
-         };
-         broadcastJSON(msg);
-         if (SERVER_FANOUT) fanoutToFollowers(senderId, msg);
-         // ❗ WICHTIG: auch in DB persistieren, damit /events/since dieses Playstate bekommt
-         await storePlaybackEvent({
-           sender_id: senderId, kind: "playstate", track_id: trackId,
-           progress_ms: progress, is_playing: true,
-           name: msg.name, artists: msg.artists, image: msg.image, ts_ms: msg.ts
-         });
-         state.hasAnnouncedResume = true;
-       }
-     } else if (!is_playing) {
-       state.hasAnnouncedResume = false; // reset, damit nächster Resume erkannt wird
-     }
-
+      // 🩵 Sofortiges Resume nach kurzer Pause:
+      // Wenn die Pause aus „Stille“ kam (playstate:false wurde gesendet) und der Sender wieder spielt,
+      // feuern wir sofort ein playstate:true + persistieren es → Receiver starten automatisch weiter.
+      if (state.wasSilentlyPaused && is_playing) {
+        const msg = {
+          type: "track",
+          kind: "playstate",
+          user: { id: senderId, name: senderName || senderId },
+          trackId,
+          progress_ms: progress,
+          name: item.name,
+          artists: (item.artists || []).map(a => a.name),
+          image: item.album?.images?.[0]?.url || null,
+          is_playing: true,
+          ts: Date.now(),
+        };
+        broadcastJSON(msg);
+        if (SERVER_FANOUT) fanoutToFollowers(senderId, msg);
+        await storePlaybackEvent({
+          sender_id: senderId, kind: "playstate", track_id: trackId,
+          progress_ms: progress, is_playing: true,
+          name: msg.name, artists: msg.artists, image: msg.image, ts_ms: msg.ts
+        });
+        state.wasSilentlyPaused = false;
+        state.hasAnnouncedResume = true;
+      }
+      if (!is_playing) {
+        state.hasAnnouncedResume = false; // defensiv reset
+      }
     } catch (e) {
       console.warn(`[POLL][ERR] ${senderId} ${e?.message || e}`);
     }
