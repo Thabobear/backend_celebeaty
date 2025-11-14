@@ -140,7 +140,13 @@ async function getPushTokensForUsers(userIds = []) {
     `SELECT expo_token FROM push_tokens WHERE user_id = ANY($1)`,
     [userIds]
   );
-  return rows.map(r => r.expo_token).filter(Boolean);
+  const tokens = rows.map(r => r.expo_token).filter(Boolean);
+  if (!tokens.length) {
+    console.log("[PUSH] no expo tokens for users", userIds);
+  } else {
+    console.log("[PUSH] loaded", tokens.length, "expo tokens for users", userIds);
+  }
+  return tokens;
 }
 async function sendExpoPush(expoTokens, title, body) {
   if (!expoTokens.length) return;
@@ -1073,16 +1079,19 @@ function startPollingForSender(senderId, senderName) {
         });
         console.log(`[EVT][STORE] playstate ${senderId} is_playing=${is_playing} @${progress}`);
 
-        // 🔴 NEU: Sobald der Sender pausiert, Session sofort beenden + Push an den Sender
+        // 🔴 Sobald der Sender pausiert, Session sofort beenden + Push an den Sender
         if (!is_playing) {
           try {
             const tokens = await getPushTokensForUsers([senderId]);
-            if (tokens.length) {
+            if (!tokens.length) {
+              console.log("[PUSH] pause-end: no push token registered for sender", senderId);
+            } else {
               await sendExpoPush(
                 tokens,
                 "Session beendet",
                 "Du hast pausiert – deine Live-Session wurde beendet."
               );
+              console.log("[PUSH] pause-end: push sent to sender", senderId);
             }
           } catch (e) {
             console.warn("[PUSH] pause-end for sender failed:", e?.message || e);
