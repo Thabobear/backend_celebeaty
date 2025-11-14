@@ -882,11 +882,13 @@ function startGraceKeepAliveForFollowers(senderId) {
           devices.find(d => !d?.is_restricted) ||
           devices[0];
         if (!device) return;
-        // 🚫 Kein Ton: transfer auf dasselbe Device mit play:false
+        // 🚫 Kein Ton: 1) Self-Transfer play:false (zählt oft als Aktivität)
         await spPutForUser(followerId, "https://api.spotify.com/v1/me/player", {
           device_ids: [device.id],
           play: false,
         });
+        // 🙈 Falls Self-Transfer ignoriert wird: 2) explizit nochmal „pause“ (No-Op, aber Aktivität)
+        await spPutForUser(followerId, "https://api.spotify.com/v1/me/player/pause", {});
       } catch { /* still & silent */ }
     }, KEEPALIVE_INTERVAL_MS);
 
@@ -1157,6 +1159,11 @@ function startPollingForSender(senderId, senderName) {
         if (SERVER_FANOUT) fanoutToFollowers(senderId, msg);
         // persistieren (nur „relevante“ Events)
         await storePlaybackEvent({
+
+        // ⏱️ NEU: bei jeder erkannten Pause sofort Geräte der Follower „wach halten“
+        if (!is_playing) {
+          startGraceKeepAliveForFollowers(senderId);
+        }
           sender_id: senderId, kind: "trackchange", track_id: trackId,
           progress_ms: progress, is_playing, name: msg.name, artists: msg.artists, image: msg.image, ts_ms: now
         });
