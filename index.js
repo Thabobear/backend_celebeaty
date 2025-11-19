@@ -1,3 +1,4 @@
+//
 /**
  * Celebeaty – Single-Origin Backend (Express + WS + React Build)
  * Serverseitiges Polling für Sender, damit Events auch bei Hintergrund/Sperre weiterlaufen.
@@ -1215,6 +1216,20 @@ async function stopPollingForSender(senderId, senderName, reason = null) {
 
   // ➜ Alle DB-Replayer dieses Senders stoppen
   stopAllReplayersForSender(senderId);
+
+  // 🔥 WICHTIG: Session in der DB als inaktiv markieren,
+  // egal ob Timeout, app_closed oder manueller Stop.
+  try {
+    await pool.query(
+      `UPDATE sessions
+       SET is_active = false
+       WHERE sender_spotify_id = $1`,
+      [senderId]
+   );
+  } catch (e) {
+    console.warn("[SESSIONS] failed to deactivate session for", senderId, e.message);
+  }
+
 
   // (Optional, aber empfohlen) Pause-Kante persistieren, damit DB-Consumer sie sehen
   try {
