@@ -482,6 +482,32 @@ app.get("/whoami", async (req, res) => {
     if (r.status >= 400) return res.status(r.status).json({ error: "spotify_error", details: r.data });
 
     const j = r.data || {};
+
+    // 🔐 Sicherstellen, dass jeder eingeloggte User einmal in "users" landet
+    try {
+      await pool.query(
+        `
+        INSERT INTO users (id, display_name, email, country, product, created_at, updated_at)
+        VALUES ($1,$2,$3,$4,$5, now(), now())
+        ON CONFLICT (id) DO UPDATE SET
+          display_name = EXCLUDED.display_name,
+          email        = COALESCE(EXCLUDED.email, users.email),
+          country      = COALESCE(EXCLUDED.country, users.country),
+          product      = COALESCE(EXCLUDED.product, users.product),
+          updated_at   = now()
+        `,
+        [
+          j.id,
+          j.display_name || j.id || null,
+          j.email || null,
+          j.country || null,
+          j.product || null,
+        ]
+      );
+    } catch (e) {
+      console.warn("[whoami] upsert users failed:", e.message);
+    }
+
     return res.json({
       id: j.id,
       display_name: j.display_name || j.id || null,
@@ -615,26 +641,170 @@ async function getCurrentSpotifyId(req, res) {
   return { id: me.data.id, name: me.data.display_name || me.data.id };
 }
 
+/* -------------------- Social Follows ----------------------- */
+// Folge einem anderen User
+app.post("/me/follow", async (req, res) => {
+  try {
+    const who = await getCurrentSpotifyId(req, res);
+    if (who.error) return res.status(who.error.status || 401).json(who.error.body || { error: "no_me" });
 
+    const { target_id } = req.body || {};
+    const targetId = (target_id || "").toString().trim();
+    if (!targetId) return res.status(400).json({ error: "missing_target_id" });
+    if (targetId === who.id) return res.status(400).json({ error: "cannot_follow_self" });
 
+    await pool.query(
+      `INSERT INTO user_follows (follower_id, followee_id)
+       VALUES ($1, $2)
+       ON CONFLICT DO NOTHING`,
+      [who.id, targetId]
+    );
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("me/follow error:", e.message);
+    return res.status(500).json({ error: "follow_failed" });
+  }
+});
+
+// Entfolge einem User
+app.post("/me/unfollow", async (req, res) => {
+  try {
+    const who = await getCurrentSpotifyId(req, res);
+    if (who.error) return res.status(who.error.status || 401).json(who.error.body || { error: "no_me" });
+
+    const { target_id } = req.body || {};
+    const targetId = (target_id || "").toString().trim();
+    if (!targetId) return res.status(400).json({ error: "missing_target_id" });
+
+    await pool.query(
+      `DELETE FROM user_follows WHERE follower_id = $1 AND followee_id = $2`,
+      [who.id, targetId]
+    );
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("me/unfollow error:", e.message);
+    return res.status(500).json({ error: "unfollow_failed" });
+  }
+});
+
+// Liste aller, denen ich folge
+app.get("/me/following", async (req, res) => {
+  try {
+    const who = await getCurrentSpotifyId(req, res);
+    if (who.error) return res.status(who.error.status || 401).json(who.error.body || { error: "no_me" });
+
+    const { rows } = await pool.query(
+      `SELECT f.followee_id AS id, COALESCE(u.display_name, f.followee_id) AS display_name
+       FROM user_follows f
+       LEFT JOIN users u ON u.id = f.followee_id
+       WHERE f.follower_id = $1
+       ORDER BY display_name ASC`,
+      [who.id]
+    );
+
+    return res.json({ ok: true, users: rows });
+  } catch (e) {
+    console.error("me/following error:", e.message);
+    return res.status(500).json({ error: "following_failed" });
+  }
+});
+
+// User-Verzeichnis mit Suche + Flag, ob ich ihnen folge
+app.get("/users/search", async (req, res) => {
+  try {
+    const who = await getCurrentSpotifyId(req, res);
+    if (who.error) return res.status(who.error.status || 401).json(who.error.body || { error: "no_me" });
+
+    const q = (req.query.q || "").toString().trim();
+
+    const { rows } = await pool.query(
+      `SELECT
+         u.id,
+         COALESCE(u.display_name, u.id) AS display_name,
+         EXISTS (
+           SELECT 1 FROM user_follows f
+           WHERE f.follower_id = $1 AND f.followee_id = u.id
+         ) AS is_following
+       FROM users u
+       WHERE u.id <> $1
+         AND (
+           $2 = '' OR
+           u.display_name ILIKE '%' || $2 || '%' OR
+           u.id          ILIKE '%' || $2 || '%'
+         )
+       ORDER BY display_name ASC
+       LIMIT 50`,
+      [who.id, q]
+    );
+
+    return res.json({ ok: true, users: rows });
+  } catch (e) {
+    console.error("users/search error:", e.message);
+    return res.status(500).json({ error: "users_search_failed" });
+  }
+});
 
 app.get("/sessions/active", async (req, res) => {
   try {
-    const { rows } = await pool.query(
-      `
-      SELECT 
-        s.id AS session_id,
-        s.sender_spotify_id AS user_id,
-        COALESCE(u.display_name, s.sender_spotify_id) AS display_name,
-        s.created_at,
-        s.last_snapshot_at
-      FROM sessions s
-      LEFT JOIN users u ON u.id = s.sender_spotify_id
-      WHERE s.is_active = true
-      ORDER BY COALESCE(s.last_snapshot_at, s.created_at) DESC
-      LIMIT 50
-      `
-    );
+    let currentUserId = null;
+    try {
+      const t = await withValidAccessToken(req, res);
+      if (!t.error) {
+        const me = await spotifyGet("https://api.spotify.com/v1/me", t.accessToken);
+        if (me.status === 200 && me.data && me.data.id) {
+          currentUserId = me.data.id;
+        }
+      }
+    } catch {
+      // kein gültiger Login → Fallback ohne Filter
+    }
+
+    let rows;
+
+    if (currentUserId) {
+      // Nur Sessions von Usern, denen ich folge
+      const q = await pool.query(
+        `
+        SELECT 
+          s.id AS session_id,
+          s.sender_spotify_id AS user_id,
+          COALESCE(u.display_name, s.sender_spotify_id) AS display_name,
+          s.created_at,
+          s.last_snapshot_at
+        FROM sessions s
+        LEFT JOIN users u ON u.id = s.sender_spotify_id
+        WHERE s.is_active = true
+          AND s.sender_spotify_id IN (
+            SELECT followee_id FROM user_follows WHERE follower_id = $1
+          )
+        ORDER BY COALESCE(s.last_snapshot_at, s.created_at) DESC
+        LIMIT 50
+        `,
+        [currentUserId]
+      );
+      rows = q.rows;
+    } else {
+      // Fallback: altes Verhalten (z.B. wenn jemand ohne Token /sessions/active aufruft)
+      const q = await pool.query(
+        `
+        SELECT 
+          s.id AS session_id,
+          s.sender_spotify_id AS user_id,
+          COALESCE(u.display_name, s.sender_spotify_id) AS display_name,
+          s.created_at,
+          s.last_snapshot_at
+        FROM sessions s
+        LEFT JOIN users u ON u.id = s.sender_spotify_id
+        WHERE s.is_active = true
+        ORDER BY COALESCE(s.last_snapshot_at, s.created_at) DESC
+        LIMIT 50
+        `
+      );
+      rows = q.rows;
+    }
+
     res.json({
       active: rows.length,
       sessions: rows.map((r) => ({
