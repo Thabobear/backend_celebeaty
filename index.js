@@ -299,27 +299,30 @@ app.post("/push/register", async (req, res) => {
   try {
     const t = await withValidAccessToken(req, res);
     if (t.error) return res.status(t.error.status).json(t.error.body);
+
     const me = await spotifyGet("https://api.spotify.com/v1/me", t.accessToken);
     if (me.status !== 200) return res.status(401).json({ error: "me_failed" });
     const userId = me.data.id;
-    // akzeptiere { expo_token } ODER { token } aus dem Frontend
+
     const expoToken =
       (req.body && (req.body.expo_token || req.body.token))
         ? String(req.body.expo_token || req.body.token)
         : "";
+
+    console.log("[PUSH][REGISTER] raw body:", req.body);
+    console.log("[PUSH][REGISTER] user:", userId, "token:", expoToken);
+
     if (!expoToken) {
+      console.log("[PUSH][REGISTER] missing_expo_token for user", userId);
       return res.status(400).json({ error: "missing_expo_token" });
     }
-    // einfache Plausibilitätsprüfung
     if (!/^ExponentPushToken\[\S+\]$/.test(expoToken)) {
+      console.log("[PUSH][REGISTER] invalid_token_format for user", userId, "token:", expoToken);
       return res.status(400).json({ error: "invalid_token_format" });
     }
-    console.log(
-      "[PUSH][REGISTER]",
-      "user:", userId,
-      "token:", expoToken
-    );
+
     await upsertPushToken(userId, expoToken);
+    console.log("[PUSH][REGISTER] stored token for user", userId);
     res.json({ ok: true });
   } catch (e) {
     console.error("push/register error:", e.message);
