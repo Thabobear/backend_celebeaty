@@ -314,6 +314,11 @@ app.post("/push/register", async (req, res) => {
     if (!/^ExponentPushToken\[\S+\]$/.test(expoToken)) {
       return res.status(400).json({ error: "invalid_token_format" });
     }
+    console.log(
+      "[PUSH][REGISTER]",
+      "user:", userId,
+      "token:", expoToken
+    );
     await upsertPushToken(userId, expoToken);
     res.json({ ok: true });
   } catch (e) {
@@ -1366,11 +1371,11 @@ async function stopPollingForSender(senderId, senderName, reason = null) {
       trackId: lastTrackId,
       progressMs: lastProgress,
     });
-    // 🔔 echte Pushes an alle Follower über die zentrale Push-Funktion
-    await pushSessionEndedToFollowers(senderId, {
-        senderName,
-        trackId: lastTrackId,
-        progressMs: lastProgress,
+    // 🔔 echte Pushes an alle aktuellen Follower
+    pushSessionEndedToFollowers(senderId, {
+      senderName,
+      trackId: lastTrackId,
+      progressMs: lastProgress,
     });
     // danach Session-Ende signalisieren
     broadcastSessionEnded(senderId, senderName, reason);
