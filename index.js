@@ -1366,11 +1366,11 @@ async function stopPollingForSender(senderId, senderName, reason = null) {
       trackId: lastTrackId,
       progressMs: lastProgress,
     });
-    // 🔔 echte Pushes an alle aktuellen Follower
-    pushSessionEndedToFollowers(senderId, {
-      senderName,
-      trackId: lastTrackId,
-      progressMs: lastProgress,
+    // 🔔 echte Pushes an alle Follower über die zentrale Push-Funktion
+    await pushSessionEndedToFollowers(senderId, {
+        senderName,
+        trackId: lastTrackId,
+        progressMs: lastProgress,
     });
     // danach Session-Ende signalisieren
     broadcastSessionEnded(senderId, senderName, reason);
